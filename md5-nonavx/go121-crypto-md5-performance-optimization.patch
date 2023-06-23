@@ -1,0 +1,108 @@
+From bade33a4cd48ef8a497d07fc366df79668d3a751 Mon Sep 17 00:00:00 2001
+From: Priya N Vaidya <priya.n.vaidya@intel.com>
+Date: Fri, 23 Sep 2022 06:31:14 -0700
+Subject: [PATCH] crypto/md5: performance optimization
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+optimized g function
+removed lea instruction
+
+@dan@kortschak.io  have run the benchmarks locally comparing this change with its parent.
+Here are the performance results.
+
+name                   old time/op    new time/op    delta
+Hash8Bytes-8              122ns ± 1%     115ns ± 2%  -6.39%  (p=0.000 n=9+10)
+Hash64-8                  205ns ± 0%     190ns ± 1%  -7.31%  (p=0.000 n=8+10)
+Hash128-8                 298ns ± 1%     275ns ± 1%  -7.82%  (p=0.000 n=9+9)
+Hash256-8                 483ns ± 1%     450ns ± 2%  -6.85%  (p=0.000 n=8+10)
+Hash512-8                 855ns ± 1%     785ns ± 1%  -8.16%  (p=0.000 n=10+10)
+Hash1K-8                 1.61µs ± 2%    1.47µs ± 0%  -8.64%  (p=0.000 n=9+9)
+Hash8K-8                 12.1µs ± 1%    11.1µs ± 1%  -8.58%  (p=0.000 n=10+10)
+Hash1M-8                 1.53ms ± 2%    1.41ms ± 2%  -8.17%  (p=0.000 n=10+10)
+Hash8M-8                 12.2ms ± 0%    11.2ms ± 2%  -7.68%  (p=0.000 n=8+10)
+Hash8BytesUnaligned-8     122ns ± 1%     114ns ± 1%  -6.69%  (p=0.000 n=9+9)
+Hash1KUnaligned-8        1.61µs ± 1%    1.47µs ± 1%  -8.72%  (p=0.000 n=10+8)
+Hash8KUnaligned-8        12.1µs ± 2%    13.1µs ±16%    ~     (p=0.138 n=10+10)
+
+name                   old speed      new speed      delta
+Hash8Bytes-8           65.4MB/s ± 1%  69.8MB/s ± 2%  +6.83%  (p=0.000 n=9+10)
+Hash64-8                313MB/s ± 0%   337MB/s ± 1%  +7.91%  (p=0.000 n=8+10)
+Hash128-8               429MB/s ± 1%   466MB/s ± 1%  +8.49%  (p=0.000 n=9+9)
+Hash256-8               529MB/s ± 1%   569MB/s ± 2%  +7.53%  (p=0.000 n=9+10)
+Hash512-8               599MB/s ± 1%   652MB/s ± 1%  +8.88%  (p=0.000 n=10+10)
+Hash1K-8                637MB/s ± 2%   697MB/s ± 1%  +9.43%  (p=0.000 n=9+9)
+Hash8K-8                677MB/s ± 1%   741MB/s ± 1%  +9.39%  (p=0.000 n=10+10)
+Hash1M-8                684MB/s ± 2%   745MB/s ± 2%  +8.90%  (p=0.000 n=10+10)
+Hash8M-8                689MB/s ± 0%   747MB/s ± 2%  +8.32%  (p=0.000 n=8+10)
+Hash8BytesUnaligned-8  65.6MB/s ± 1%  70.3MB/s ± 1%  +7.15%  (p=0.000 n=9+9)
+Hash1KUnaligned-8       635MB/s ± 1%   696MB/s ± 1%  +9.54%  (p=0.000 n=10+8)
+Hash8KUnaligned-8       677MB/s ± 2%   633MB/s ±18%    ~     (p=0.143 n=10+10)
+
+Change-Id: I16d032e199ab7313d9a11b84656dfb30e34b2131
+---
+ src/crypto/md5/md5block_amd64.s | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/crypto/md5/md5block_amd64.s b/src/crypto/md5/md5block_amd64.s
+index 7c7d92d7e8..04f71be9c2 100644
+--- a/src/crypto/md5/md5block_amd64.s
++++ b/src/crypto/md5/md5block_amd64.s
+@@ -40,10 +40,11 @@ loop:
+ 
+ #define ROUND1(a, b, c, d, index, const, shift) \
+ 	XORL	c, R9; \
+-	LEAL	const(a)(R8*1), a; \
++        ADDL    $const, a; \
+ 	ANDL	b, R9; \
++        ADDL    R8, a; \
+ 	XORL d, R9; \
+-	MOVL (index*4)(SI), R8; \
++        MOVL (index*4)(SI), R8; \
+ 	ADDL R9, a; \
+ 	ROLL $shift, a; \
+ 	MOVL c, R9; \
+@@ -72,13 +73,15 @@ loop:
+ 
+ #define ROUND2(a, b, c, d, index, const, shift) \
+ 	NOTL	R9; \
+-	LEAL	const(a)(R8*1),a; \
++	ADDL    $const, a; \
++        ANDL    c,   R9; \
++        ADDL    R8, a; \
++        MOVL    d,   R10; \
++        ADDL    R9,  a ; \
+ 	ANDL	b,		R10; \
+-	ANDL	c,		R9; \
++        ADDL    R10, a; \
+ 	MOVL	(index*4)(SI),R8; \
+-	ORL	R9,		R10; \
+ 	MOVL	c,		R9; \
+-	ADDL	R10,		a; \
+ 	MOVL	c,		R10; \
+ 	ROLL	$shift,	a; \
+ 	ADDL	b,		a
+@@ -104,7 +107,8 @@ loop:
+ 	MOVL	CX,		R9
+ 
+ #define ROUND3(a, b, c, d, index, const, shift) \
+-	LEAL	const(a)(R8*1),a; \
++	ADDL	$const,a; \
++        ADDL    R8, a; \
+ 	MOVL	(index*4)(SI),R8; \
+ 	XORL	d,		R9; \
+ 	XORL	b,		R9; \
+@@ -135,7 +139,8 @@ loop:
+ 	XORL	DX,		R9
+ 
+ #define ROUND4(a, b, c, d, index, const, shift) \
+-	LEAL	const(a)(R8*1),a; \
++        ADDL    $const, a; \
++        ADDL    R8, a; \
+ 	ORL	b,		R9; \
+ 	XORL	c,		R9; \
+ 	ADDL	R9,		a; \
+-- 
+2.34.1
+
