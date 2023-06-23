@@ -1,0 +1,2150 @@
+From a99fa6a1a91ad8c2a04f7b4b1ca920ffad2e95d2 Mon Sep 17 00:00:00 2001
+From: ted <ted.painter@intel.com>
+Date: Tue, 4 Apr 2023 00:03:46 -0400
+Subject: [PATCH] crypto/rsa: use avx-512 Integer Fused Multiply Add (IFMA)
+ instructions to optimize RSA
+
+internal/cpu: add HasIFMA detection for AMD64
+
+The crypto/rsa CL implements an optimized RSA decrypt() function that takes advantage of IFMA.
+Includes a new decrypt() function "decryptIfma2048()" called from SignPKCS1v15(), with execution
+conditioned on cpu.HasIFMA and private keys of length 2048 bits.  The exponentiation
+employs IFMA-accelerated Almost Montgomery Multiplication.
+
+The internal/cpu CL adds detection for IFMA instructions for AMD64.
+
+More information on IFMA can be found on https://www.intel.com/content/www/us/en/developer/articles/technical/fourth-generation-xeon-scalable-family-overview.html#gs.uemgn3
+
+Addresses proposal #59412
+
+Change-Id: I995db9c5ec560990726a8ed8108080ef7a62a00a
+---
+ src/crypto/rsa/pkcs1v15.go  |    9 +-
+ src/crypto/rsa/rsa_ifma.go  |  653 ++++++++++++++++
+ src/crypto/rsa/rsa_ifma.s   | 1392 +++++++++++++++++++++++++++++++++++
+ src/internal/cpu/cpu.go     |    1 +
+ src/internal/cpu/cpu_x86.go |    2 +
+ 5 files changed, 2056 insertions(+), 1 deletion(-)
+ create mode 100644 src/crypto/rsa/rsa_ifma.go
+ create mode 100644 src/crypto/rsa/rsa_ifma.s
+
+diff --git a/src/crypto/rsa/pkcs1v15.go b/src/crypto/rsa/pkcs1v15.go
+index 55fea1ab93..298e30b5c6 100644
+--- a/src/crypto/rsa/pkcs1v15.go
++++ b/src/crypto/rsa/pkcs1v15.go
+@@ -10,7 +10,9 @@ import (
+ 	"crypto/internal/randutil"
+ 	"crypto/subtle"
+ 	"errors"
++	"internal/cpu"
+ 	"io"
++	"os"
+ )
+ 
+ // This file implements encryption and decryption using PKCS #1 v1.5 padding.
+@@ -313,7 +315,12 @@ func SignPKCS1v15(random io.Reader, priv *PrivateKey, hash crypto.Hash, hashed [
+ 	copy(em[k-tLen:k-hashLen], prefix)
+ 	copy(em[k-hashLen:k], hashed)
+ 
+-	return decrypt(priv, em, withCheck)
++	_, ignoreIfma := os.LookupEnv("GO_RSA_IGNORE_IFMA")
++	if cpu.X86.HasIFMA && 255 <= len(priv.D.Bytes()) && len(priv.D.Bytes()) <= 256 && !ignoreIfma {
++		return decryptIfma2048(priv, em, withCheck)
++	} else {
++		return decrypt(priv, em, withCheck)
++	}
+ }
+ 
+ // VerifyPKCS1v15 verifies an RSA PKCS #1 v1.5 signature.
+diff --git a/src/crypto/rsa/rsa_ifma.go b/src/crypto/rsa/rsa_ifma.go
+new file mode 100644
+index 0000000000..bd847278c4
+--- /dev/null
++++ b/src/crypto/rsa/rsa_ifma.go
+@@ -0,0 +1,653 @@
++// Copyright 2009 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Modifications to support ifma
++// Copyright (C) 2023 Intel Corporation
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Based on OpenSSL
++// Copyright 1995-2022 The OpenSSL Project Authors. All Rights Reserved.
++//
++// Licensed under the Apache License 2.0 (the "License").  You may not use
++// this file except in compliance with the License.  You can obtain a copy
++// in the file LICENSE in the source distribution or at
++// https://www.openssl.org/source/license.html
++//
++
++//
++// References
++//
++// [1] Gueron, S. Efficient software implementations of modular exponentiation.
++//     DOI: 10.1007/s13389-012-0031-5
++//
++
++package rsa
++
++import (
++	"math/big"
++	"unsafe"
++)
++
++//go:noescape
++func cvt_16x64_to_20x52(_a52, _b52, _m52 *big.Word, a0, a1, b0, b1, m0, m1 []big.Word)
++func cvt_20x52_norm_to_16x64(x64 []big.Word, _x52 *big.Word)
++func amm_52x20_x1_ifma256(_res, _a, _b, _m *big.Word, _k0 uint64)
++func amm_52x20_x2_ifma256(_out, _a, _b, _m *big.Word, _k0 *uint64)
++func bn_reduce_once_in_place_16(_z, _a, _b *big.Word) big.Word
++func bn_mul_mont_16(_r, _a, _b, _n *big.Word, _n0 uint64)
++func bn_mul_mont(_r, _a, _b, _n *big.Word, _n0 *uint64, _num uint64)
++func bn_from_mont(_bn, _r, _n *big.Word, _n0 big.Word, _num uint64)
++func extract_mul_2x20_win5(_res, _table *big.Word, i1, i2 big.Word)
++
++const modulus_bitsize = 1024
++const exp_digits = 16
++const exp_win_size = 5
++const exp_win_mask = 31
++const rem = 1024 % exp_win_size
++const table_idx_mask = big.Word(exp_win_mask)
++
++// montgomery BN representation
++type mont struct {
++	ri int       // number of bits in R
++	RR *big.Int  // used to convert to montgomery form, zero-padded if necessary
++	N  *big.Int  // modulus
++	Ni *big.Int  // R*(1/R mod N) - N*Ni = 1 (Ni is only stored for bignum algorithm)
++	N0 [2]uint64 // least significant word(s) of Ni
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// newMont()
++//
++// initialize montgomery struct
++func newMont() *mont {
++	m := new(mont)
++	m.ri = 0
++	m.RR = new(big.Int)
++	m.N = new(big.Int)
++	m.Ni = new(big.Int)
++	return m
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// setMont()
++//
++// initialize montgomery val
++// assumes m.RR=0 on input, otherwise set explicitly
++func setMont(mod *big.Int, m *mont, numBits int) int {
++	var bnZero = new(big.Int).SetInt64(0)
++	var bnOne = new(big.Int).SetInt64(1)
++	var bnRi = new(big.Int).SetInt64(0)
++	var bnTmod = new(big.Int).SetBytes([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
++	if 0 == mod.Cmp(bnZero) {
++		return 0
++	}
++	m.N.Set(mod)
++	m.ri = len(mod.Bits()) * 64
++	m.RR.SetBit(m.RR, 64, 1)
++	bnTmod.SetBits(mod.Bits()[:1])
++	if 0 != bnTmod.Cmp(bnOne) {
++		bnRi.ModInverse(m.RR, bnTmod) // Ri = R^-1 mod N
++	}
++	bnRi.Lsh(bnRi, 64)
++	if 0 != bnRi.Cmp(bnZero) {
++		bnRi.Sub(bnRi, bnOne)
++	} else {
++		panic("decryptAndCheckIfma2048.setMont() internal error")
++	}
++	bnRi.Div(bnRi, bnTmod)
++	m.N0[0] = uint64(bnRi.Bits()[0])
++	m.N0[1] = 0
++
++	// setup RR for conversions
++	m.RR.SetUint64(0)
++	m.RR.SetBit(m.RR, 2*m.ri, 1)
++	m.RR.Mod(m.RR, m.N)
++
++	// high-order zeros in the bit count are truncated
++	if (m.RR.BitLen()+63)/64 != (m.N.BitLen()+63)/64 {
++		panic("decryptAndCheckIfma2048.setMont() internal error")
++	}
++	return 1
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// bn_mod_sub_fixed_top()
++//
++// Montgomery BN modular subtraction for both a and b non-negative,
++// a is less than m, while b is of same bit width as m. Implemented
++// as subtraction followed by two conditional additions.
++//
++//	0 <= a < m
++//	0 <= b < 2^w < 2*m
++//
++// after subtraction
++//
++//	-2*m < r = a - b < m
++//
++// thus up to two conditional additions required to make |r| positive
++//
++// Derived from the OpenSSL internal crypto big number function
++// bn_mod_sub_fixed_top()
++// * Copyright 1998-2021 The OpenSSL Project Authors. All Rights Reserved.
++// *
++// * Licensed under the Apache License 2.0 (the "License").  You may not use
++// * this file except in compliance with the License.  You can obtain a copy
++// * in the file LICENSE in the source distribution or at
++// * https://www.openssl.org/source/license.html
++func bn_mod_sub_fixed_top(a, b, m []big.Word) []big.Word {
++	var i, ai, bi, borrow, carry, ta, tb, mask, mtop, btop, atop big.Word
++	var r [16]big.Word
++	mtop = big.Word(len(m))
++	atop = big.Word(len(a))
++	btop = big.Word(len(b))
++	for i, ai, bi, borrow = 0, 0, 0, 0; i < mtop; {
++		mask = big.Word(big.Word(0) - ((i - atop) >> (8*8 - 1)))
++		ta = a[ai] & mask
++		mask = big.Word(big.Word(0) - ((i - btop) >> (8*8 - 1)))
++		tb = b[bi] & mask
++		r[i] = ta - tb - borrow
++		if ta != tb {
++			if ta < tb {
++				borrow = 1
++			} else {
++				borrow = 0
++			}
++		}
++		i++
++		ai += (i - 16) >> (8*8 - 1)
++		bi += (i - 16) >> (8*8 - 1)
++	}
++	for i, mask, carry = 0, 0-borrow, 0; i < mtop; i++ {
++		ta = ((m[i] & mask) + carry)
++		if ta < carry {
++			carry = 1
++		} else {
++			carry = 0
++		}
++		r[i] = (r[i] + ta)
++		if r[i] < ta {
++			carry++
++		}
++	}
++	borrow -= carry
++	for i, mask, carry = 0, 0-borrow, 0; i < mtop; i++ {
++		ta = ((m[i] & mask) + carry)
++		if ta < carry {
++			carry = 1
++		} else {
++			carry = 0
++		}
++		r[i] = (r[i] + ta)
++		if r[i] < ta {
++			carry++
++		}
++	}
++	return r[:]
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// bn_mod_exp( a, p, m )
++//
++// big number modular exponentiation; bn return val = a^p mod m;
++// makes use of BN_window_bits_for_exponent_size -- sliding window mod_exp functions
++// ror window size 'w' (w >= 2) and a random 'b' bits exponent,
++// the number of multiplications is a constant plus on average
++//
++//	2^(w-1) + (b-w)/(w+1);
++//
++// here  2^(w-1)  is for precomputing the table (we actually need
++// entries only for windows that have the lowest bit set), and
++// (b-w)/(w+1)  is an approximation for the expected number of
++// w-bit windows, not counting the first one.
++// Thus we should use
++//
++//	w >= 6  if        b > 671
++//	w = 5  if  671 > b > 239
++//	w = 4  if  239 > b >  79
++//	w = 3  if   79 > b >  23
++//	w <= 2  if   23 > b
++//
++// (with draws in between).  Very small exponents are often selected
++// with low Hamming weight, so we use  w = 1  for b <= 23.
++//
++// Derived from openSSL crypto rsa function bn_mod_exp()
++// * Copyright 1998-2021 The OpenSSL Project Authors. All Rights Reserved.
++// *
++// * Licensed under the Apache License 2.0 (the "License").  You may not use
++// * this file except in compliance with the License.  You can obtain a copy
++// * in the file LICENSE in the source distribution or at
++// * https://www.openssl.org/source/license.html
++func bn_mod_exp(a, p, m *big.Int) *big.Int {
++	bits := p.BitLen()
++	if bits == 0 {
++		panic("decryptAndCheckIfma2048.bn_mod_exp() zero length p")
++	}
++	mont := newMont()
++	setMont(m, mont, 1024)
++
++	// init temp full-length bn vectors for a, m
++	var A [32]big.Word
++	var RR [32]big.Word
++	var N [32]big.Word
++	for i := range a.Bits() {
++		A[i] = a.Bits()[i]
++	}
++	for i := range mont.RR.Bits() {
++		RR[i] = mont.RR.Bits()[i]
++	}
++	for i := range mont.N.Bits() {
++		N[i] = mont.N.Bits()[i]
++	}
++	var val [64][32]big.Word
++	var dval [32]big.Word
++	num := uint64(len(mont.N.Bits()))
++	mN := &(N[0])
++	mN0 := &(mont.N0[0])
++	d := &(dval[0])
++	bn_mul_mont(&(val[0][0]), &(A[0]), &(RR[0]), mN, mN0, num)
++
++	// init exp window
++	var w int
++	switch {
++	case bits > 671:
++		w = 6
++	case bits > 239:
++		w = 5
++	case bits > 79:
++		w = 4
++	case bits > 23:
++		w = 3
++	default:
++		w = 1
++	}
++	if w > 1 {
++		bn_mul_mont(d, &(val[0][0]), &(val[0][0]), mN, mN0, num)
++		j := 1 << (w - 1)
++		for i := 1; i < j; i++ {
++			bn_mul_mont(&(val[i][0]), &(val[i-1][0]), d, mN, mN0, num)
++		}
++	}
++
++	// avoid multiplication etc
++	// when there is only the value '1' in the buffer
++	start := 1
++	wvalue := 0        // win val
++	wstart := bits - 1 // win top bit
++	wend := 0          // win bottom bit
++
++	// by Shay Gueron's suggestion
++	j := len(m.Bits())
++	mw := m.Bits()
++
++	// rw.[]Words must be 2x length of m to hold carry words during conversion
++	// from mont currently largest expected m is 32
++	var rw [64]big.Word
++	var rrw [64]big.Word
++	var bnOne [32]big.Word
++	bnOne[0] = 1
++	r := &(rw[0])
++	rr := &(rrw[0])
++	if mw[j-1]&0x8000000000000000 != 0 {
++		/* 2^(top*BN_BITS2) - m */
++		rw[0] = 0 - mw[0]
++		for i := 1; i < j; i++ {
++			rw[i] = ^mw[i]
++		}
++	} else {
++		bn_mul_mont(r, &(bnOne[0]), &(RR[0]), mN, mN0, num)
++	}
++	dbg := 0
++	for true {
++		dbg++
++		if p.Bit(wstart) == 0 {
++			if start == 0 {
++				bn_mul_mont(r, r, r, mN, mN0, num)
++			}
++			if wstart == 0 {
++				break
++			}
++			wstart--
++			continue
++		}
++
++		// wstart is on a 'set' bit; next determine win size by scanning forward
++		// until the last set bit before window end
++		wvalue = 1
++		wend = 0
++		for i := 1; i < w; i++ {
++			if wstart-i < 0 {
++				break
++			}
++			if p.Bit(wstart-i) == 1 {
++				wvalue <<= (i - wend)
++				wvalue |= 1
++				wend = i
++			}
++		}
++
++		// wend is the size of the current window
++		j = wend + 1
++
++		// add the 'bytes above'
++		if start == 0 {
++			for i := 0; i < j; i++ {
++				bn_mul_mont(r, r, r, mN, mN0, num)
++			}
++		}
++
++		// wvalue will be an odd number < 2^window
++		bn_mul_mont(r, r, &(val[wvalue>>1][0]), mN, mN0, num)
++
++		// move 'window' down further
++		wstart -= wend + 1
++		wvalue = 0
++		start = 0
++		if wstart < 0 {
++			break
++		}
++	}
++	bn_from_mont(rr, r, mN, big.Word(mont.N0[0]), num)
++	ret := new(big.Int)
++	ret.SetBits(rrw[:(num + 1)])
++	return ret
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// getSliceWordAlign64()
++//
++// get 64-bit aligned slice
++func getSliceWordAlign64(n int) []big.Word {
++	const align = 64
++	v := make([]big.Word, n+align/8)
++	for i := range v {
++		if uintptr(unsafe.Pointer(&v[i]))%align == 0 {
++			return v[i:]
++		}
++	}
++	panic("could get 64-byte aligned []big.Word")
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// getAlginedBuffers()
++//
++// get aligned buffers for ifma ops in decryptAndCheck()
++func getAlignedBuffers() (Base52, M52, RR52, Coeff, Table, X, Y, Expz []big.Word) {
++	buf := getSliceWordAlign64(1534)
++	Base52 = buf[:40]
++	M52 = buf[40:80]
++	RR52 = buf[80:120]
++	Coeff = buf[120:140]
++	Table = buf[140:1420]
++	X = buf[1420:1460]
++	Y = buf[1460:1500]
++	Expz = buf[1500:1534]
++	return Base52, M52, RR52, Coeff, Table, X, Y, Expz
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// exponentiation()
++//
++// w-ary modular exponentiation using prime moduli of
++// the same bit size using Almost Montgomery Multiplication, with
++// the parameter w (window size) = 5;
++//
++// Derived from OpenSSL crypto big number function RSAZ_mod_exp_x2_ifma256()
++// * Copyright 1998-2021 The OpenSSL Project Authors. All Rights Reserved.
++// *
++// * Licensed under the Apache License 2.0 (the "License").  You may not use
++// * this file except in compliance with the License.  You can obtain a copy
++// * in the file LICENSE in the source distribution or at
++// * https://www.openssl.org/source/license.html
++func exponentiation(x, y, m, table *big.Word, k0 *uint64, expz []big.Word) {
++	exp_bit_no := modulus_bitsize - rem
++	exp_chunk_no := exp_bit_no / 64
++	exp_chunk_shift := exp_bit_no % 64
++
++	// process 1-st exp window - just init result
++	// the function operates with fixed moduli sizes divisible by 64,
++	// thus table index here is always in supported range [0, EXP_WIN_SIZE).
++	idx0 := big.Word(expz[exp_chunk_no]) >> exp_chunk_shift
++	idx1 := big.Word(expz[exp_chunk_no+(exp_digits+1)]) >> exp_chunk_shift
++	extract_mul_2x20_win5(y, table, idx0, idx1)
++
++	// process other exp windows
++	for exp_bit_no -= exp_win_size; exp_bit_no >= 0; exp_bit_no -= exp_win_size {
++
++		// extract pre-computed multiplier from the table
++		exp_chunk_no = exp_bit_no / 64
++		exp_chunk_shift = exp_bit_no % 64
++		idx0 = expz[exp_chunk_no]
++		T := expz[exp_chunk_no+1]
++		idx0 >>= exp_chunk_shift
++
++		// get additional bits from then next quadword
++		// when 64-bit boundaries are crossed
++		if exp_chunk_shift > 64-exp_win_size {
++			T <<= (64 - exp_chunk_shift)
++			idx0 ^= T
++		}
++		idx0 &= table_idx_mask
++		idx1 = expz[exp_chunk_no+1*(exp_digits+1)]
++		T = expz[exp_chunk_no+1+1*(exp_digits+1)]
++		idx1 >>= exp_chunk_shift
++
++		// get additional bits from then next quadword
++		// when 64-bit boundaries are crossed.
++		if exp_chunk_shift > 64-exp_win_size {
++			T <<= (64 - exp_chunk_shift)
++			idx1 ^= T
++		}
++		idx1 &= table_idx_mask
++		extract_mul_2x20_win5(x, table, idx0, idx1)
++
++		// series of squaring
++		amm_52x20_x2_ifma256(y, y, y, m, k0)
++		amm_52x20_x2_ifma256(y, y, y, m, k0)
++		amm_52x20_x2_ifma256(y, y, y, m, k0)
++		amm_52x20_x2_ifma256(y, y, y, m, k0)
++		amm_52x20_x2_ifma256(y, y, y, m, k0)
++		amm_52x20_x2_ifma256(y, y, x, m, k0)
++	}
++}
++
++// ////////////////////////////////////////////////////////////////////////////
++//
++// decryptIfma2048()
++//
++// implements crypto/rsa function decryptAndCheck(),
++// optmized for 2048-bit keys using avx-512 and ifma instructions
++//
++// Derived from OpenSSL crypto rsa function rsa_ossl_mod_exp()
++// * Copyright 1998-2021 The OpenSSL Project Authors. All Rights Reserved.
++// *
++// * Licensed under the Apache License 2.0 (the "License").  You may not use
++// * this file except in compliance with the License.  You can obtain a copy
++// * in the file LICENSE in the source distribution or at
++// * https://www.openssl.org/source/license.html
++func decryptIfma2048(priv *PrivateKey, ciphertext []byte, check bool) ([]byte, error) {
++
++	const RSA_MAX_NUM_PRIMES = 5
++
++	// switch on number of primes, either 2 or >2
++	c := new(big.Int).SetBytes(ciphertext)
++	switch len(priv.Primes) {
++	case 2:
++		R0 := new(big.Int)
++		R1 := new(big.Int).Mod(c, priv.Primes[0])
++		M1 := new(big.Int).Mod(c, priv.Primes[1])
++		Mp := newMont()
++		Mq := newMont()
++		P := priv.Primes[0]
++		Q := priv.Primes[1]
++		setMont(priv.Primes[0], Mp, 1024)
++		setMont(priv.Primes[1], Mq, 1024)
++
++		// align intermediate result buffers on 64-byte boundaries
++		Base52, M52, RR52, Coeff, Table, X, Y, Expz := getAlignedBuffers()
++
++		// 2048-bit radix-52 bn buffer pointers
++		// each buffer contains 2 consecutive big numbers represented in Go nat format
++		// i.e., for 2048-bits a little-endian vector of 20 x radix-52-bit uwords (LS word first) --> "nat_r52_LE_2048"
++		base_0 := &(Base52[0]) // base_0; Base52 holds 2 consecutive bn base_0, base_1, each nat_r52_LE_2048
++		rr_0 := &(RR52[0])     // rr_0 nat_r52_2048
++		rr_1 := &(RR52[20])    // rr_1 	  "  "
++		m_0 := &(M52[0])       // m_0  	  "  "
++		m_1 := &(M52[20])      // m52_1 	"  "
++		coeff := &(Coeff[0])
++		x := &(X[0])
++		y := &(Y[0])
++
++		// convert base_i, m_i, rr_i, from radix 64 to radix 52
++		cvt_16x64_to_20x52(base_0, m_0, rr_0, M1.Bits(), R1.Bits(), Q.Bits(), P.Bits(), Mq.RR.Bits(), Mp.RR.Bits())
++
++		// Compute target domain Montgomery converters RR' for each modulus
++		// based on precomputed original domain's RR.
++		//   RR -> RR' transformation steps:
++		//    (1) coeff = 2^k
++		//    (2) t = AMM(RR,RR) = RR^2 / R' mod m
++		//    (3) RR' = AMM(t, coeff) = RR^2 * 2^k / R'^2 mod m
++		//   where
++		//    k = 4 * (52 * digits52 - modlen)
++		//    R  = 2^(64 * ceil(modlen/64)) mod m
++		//    RR = R^2 mod m
++		//    R' = 2^(52 * ceil(modlen/52)) mod m
++		//    EX/ modlen = 1024: k = 64, RR = 2^2048 mod m, RR' = 2^2080 mod m
++		Coeff[1] = 0x1000                                      // (1), using radix 52
++		amm_52x20_x1_ifma256(rr_0, rr_0, rr_0, m_0, Mq.N0[0])  // (2) for m1
++		amm_52x20_x1_ifma256(rr_0, rr_0, coeff, m_0, Mq.N0[0]) // (3) for m1
++		amm_52x20_x1_ifma256(rr_1, rr_1, rr_1, m_1, Mp.N0[0])  // (2) for m2
++		amm_52x20_x1_ifma256(rr_1, rr_1, coeff, m_1, Mp.N0[0]) // (3) for m2
++
++		// Compute table of powers base^i, i = 0, ..., (2^EXP_WIN_SIZE) - 1
++		//  table[0] = mont(x^0) = mont(1)
++		//  table[1] = mont(x^1) = mont(x)
++		X[0] = 1
++		X[20] = 1
++		k0 := [2]uint64{Mq.N0[0], Mp.N0[0]}
++		amm_52x20_x2_ifma256(&(Table[0]), x, rr_0, m_0, &(k0[0]))
++		amm_52x20_x2_ifma256(&(Table[40]), base_0, rr_0, m_0, &(k0[0]))
++		for idx := 1; idx < 16; idx++ {
++			amm_52x20_x2_ifma256(&(Table[(2*idx)*40]), &(Table[(1*idx)*40]), &(Table[(1*idx)*40]), m_0, &(k0[0]))
++			amm_52x20_x2_ifma256(&(Table[(2*idx+1)*40]), &(Table[(2*idx)*40]), &(Table[40]), m_0, &(k0[0]))
++		}
++
++		// copy and expand exponents
++		copy(Expz, priv.Precomputed.Dq.Bits())
++		copy(Expz[17:], priv.Precomputed.Dp.Bits())
++		exponentiation(x, y, m_0, &(Table[0]), &(k0[0]), Expz)
++
++		// after the last AMM of exponentiation in Montgomery domain, the result
++		// may be (modulus_bitsize + 1), but the conversion out of Montgomery domain
++		// performs an AMM(x,1) which guarantees that the final result is less than
++		// |m|, so no conditional subtraction is needed here. See [1] for details.
++		// convert result back in regular 2^52 domain
++		for i := range X {
++			X[i] = 0
++		}
++		X[0] = 1
++		X[20] = 1
++		amm_52x20_x2_ifma256(rr_0, y, x, m_0, &(k0[0]))
++
++		// convert results back to radix 2^64
++		cvt_20x52_norm_to_16x64(X, rr_0)
++		cvt_20x52_norm_to_16x64(Y, rr_1)
++		bn_reduce_once_in_place_16(rr_0, x, &(Q.Bits()[0]))
++		bn_reduce_once_in_place_16(&(RR52[16]), y, &(P.Bits()[0]))
++		M1.SetBits(RR52[0:16])
++		R1.SetBits(RR52[16:32])
++		R1.SetBits(bn_mod_sub_fixed_top(R1.Bits(), M1.Bits(), P.Bits()))
++
++		// r1 = r1 * iqmp mod p
++		r1 := &(R1.Bits()[0])
++		bn_mul_mont_16(r1, r1, &(Mp.RR.Bits()[0]), &(Mp.N.Bits()[0]), Mp.N0[0])
++		bn_mul_mont_16(r1, r1, &(priv.Precomputed.Qinv.Bits()[0]), &(Mp.N.Bits()[0]), Mp.N0[0])
++		R0.Mul(R1, Q)
++		R0.Add(R0, M1)
++
++		// verify
++		//		if check {
++		//			ct, _ := encrypt(&priv.PublicKey, R0.Bytes())
++		//			if bytes.Compare(ct, ciphertext) != 0 {
++		//				return nil, ErrDecryption
++		//			}
++		//		}
++		return R0.Bytes(), nil
++
++	// multi-prime
++	default:
++		var M [RSA_MAX_NUM_PRIMES - 2]*big.Int
++		var PP [RSA_MAX_NUM_PRIMES]*big.Int
++
++		// I mod Q
++		R1 := new(big.Int).Mod(c, priv.Primes[1])
++		R2 := new(big.Int)
++		M1 := bn_mod_exp(R1, priv.Precomputed.Dq, priv.Primes[1])
++
++		// I mod P
++		R1 = R1.Mod(c, priv.Primes[0])
++
++		// R0 = R1^dmp1 mod P
++		R0 := bn_mod_exp(R1, priv.Precomputed.Dp, priv.Primes[0])
++
++		for i := 2; i < len(priv.Primes); i++ {
++			// I mod P
++			R1 = R1.Mod(c, priv.Primes[i])
++
++			// M[i] = R1 ^ dmp[i] mod P[i]
++			M[i-2] = bn_mod_exp(R1, priv.Precomputed.CRTValues[i-2].Exp, priv.Primes[i])
++		}
++
++		// stop size of r0 increasing, which does affect the multiply if it optimised for a power of 2 size
++		R0.Sub(R0, M1)
++		if R0.Sign() < 0 {
++			R0.Add(R0, priv.Primes[0]) // R0 = R0 - P
++		}
++		R1.Mul(R0, priv.Precomputed.Qinv)
++		R0.Mod(R1, priv.Primes[0])
++
++		// if p < q it is occasionally possible for the correction of adding 'p'
++		// if r0 is negative above to leave the result still negative. This can
++		// break the private key operations: the following second correction
++		// should *always* correct this rare occurrence.
++		if R0.Sign() < 0 {
++			R0.Add(R0, priv.Primes[0])
++		}
++		R1.Mul(R0, priv.Primes[1])
++		R0.Add(R1, M1)
++
++		// use R1 to compute PP[i]
++		PP[2] = new(big.Int).Mul(priv.Primes[0], priv.Primes[1])
++		for i := 3; i < len(priv.Primes); i++ {
++			PP[i] = new(big.Int)
++			PP[i].Mul(priv.Primes[i], PP[i-1])
++		}
++
++		for i := 2; i < len(priv.Primes); i++ {
++			R1.Sub(M[i-2], R0)
++			R2.Mul(R1, priv.Precomputed.CRTValues[i-2].Coeff)
++			R1.Mod(R2, priv.Primes[i])
++			if R1.Sign() < 0 {
++				R1.Add(R1, priv.Primes[i])
++			}
++			R1.Mul(R1, PP[i])
++			R0.Add(R0, R1)
++		}
++
++		// verify
++		//		if check {
++		//			ct, _ := encrypt(&priv.PublicKey, R0.Bytes())
++		//			if bytes.Compare(ct, ciphertext) != 0 {
++		//				return nil, ErrDecryption
++		//			}
++		//		}
++		return R0.Bytes(), nil
++	}
++}
+diff --git a/src/crypto/rsa/rsa_ifma.s b/src/crypto/rsa/rsa_ifma.s
+new file mode 100644
+index 0000000000..edcc42195c
+--- /dev/null
++++ b/src/crypto/rsa/rsa_ifma.s
+@@ -0,0 +1,1392 @@
++// Copyright 2022 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Modifications to support ifma 
++// Copyright (C) 2023 Intel Corporation
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Based on OpenSSL 
++// Copyright 2020-2022 The OpenSSL Project Authors. All Rights Reserved.
++//# Copyright (c) 2020, Intel Corporation. All Rights Reserved.
++//#
++//# Licensed under the Apache License 2.0 (the "License").  You may not use
++//# this file except in compliance with the License.  You can obtain a copy
++//# in the file LICENSE in the source distribution or at
++//# https://www.openssl.org/source/license.html
++//#
++//#
++//# Originally written by Sergey Kirillov and Andrey Matyukov.
++//# Special thanks to Ilya Albrekht for his valuable hints.
++//# Intel Corporation
++//#
++//# Implementation utilizes 256-bit (ymm) registers to avoid frequency scaling issues.
++
++// Copyright 2005-2020 The OpenSSL Project Authors. All Rights Reserved.
++// #
++// # Licensed under the Apache License 2.0 (the "License").  You may not use
++// # this file except in compliance with the License.  You can obtain a copy
++// # in the file LICENSE in the source distribution or at
++// # https://www.openssl.org/source/license.html
++//
++// # ====================================================================
++// # Written by Andy Polyakov <appro@openssl.org> for the OpenSSL
++// # project. The module is, however, dual licensed under OpenSSL and
++// # CRYPTOGAMS licenses depending on where you obtain it. For further
++// # details see http://www.openssl.org/~appro/cryptogams/.
++// # ====================================================================
++
++#include "textflag.h"
++
++// ###############################################################################
++// # amm_52x20_x1_ifma256( res, a, b, m []big.Word, k0 big.Word )
++// #
++// # Almost Montgomery Multiplication (AMM) for 20-digit number in radix 2^52 
++// # AMM is defined as presented in the paper [1].
++// #
++// # The input and output are presented in 2^52 radix domain, i.e.
++// #   |res|, |a|, |b|, |m| are arrays of 20 64-bit qwords with 12 high bits zeroed.
++// #   |k0| is a Montgomery coefficient, which is here k0 = -1/m mod 2^64
++// #
++// # NB: the AMM implementation does not perform "conditional" subtraction step
++// # specified in the original algorithm as according to the Lemma 1 from the paper
++// # [2], the result will be always < 2*m and can be used as a direct input to
++// # the next AMM iteration.  This post-condition is true, provided the correct
++// # parameter |s| (notion of the Lemma 1 from [2]) is chosen, i.e.  s >= n + 2 * k,
++// # which matches our case: 1040 > 1024 + 2 * 1.
++// #
++// # [1] Gueron, S. Efficient software implementations of modular exponentiation.
++// #     DOI: 10.1007/s13389-012-0031-5
++// # [2] Gueron, S. Enhanced Montgomery Multiplication.
++// #     DOI: 10.1007/3-540-36400-5_5
++// #
++// # derived from similar AMM implementation in openSSL crypto rsa bn libraries
++// ###############################################################################
++#define res         DI
++#define a           SI
++#define b           DX
++#define m           CX
++#define k0x         R8
++#define mask52      AX
++#define iter        BX
++#define acc0_0      R9
++#define acc0_1      R15
++#define b_ptr       R11
++#define zero        Y0
++#define T0          Y0
++#define Bi          Y1
++#define T0h         Y1
++#define Yi          Y2
++#define T1          Y2
++#define R0_0        Y3
++#define R0_0x       X3
++#define R0_1        Y4
++#define R0_1x       X4
++#define R0_0h       Y16
++#define R1_0        Y17
++#define R1_0h       Y18
++#define R2_0        Y19
++#define R0_1h       Y20
++#define R1_1        Y21
++#define R1_1h       Y22
++#define R2_1        Y23
++#define T1h         Y25
++#define T2          Y26
++
++#define amm52x20_x1(dataOffset, bOffset, acc, R0, R0x, R0h, R1, R1h, R2, k0) \
++  MOVQ            (bOffset)(b_ptr), R13                   /* b[i] */                              \
++  VPBROADCASTQ    R13, Bi                                 /* broadcast b[i] */                    \
++  MOVQ            (dataOffset)(a), DX                                                             \
++  MULXQ           R13, R13, R12                           /* a[0]*b[i] = (t0,t2) */               \
++  ADDQ            R13, acc                                /* acc += t0 */                         \
++  MOVQ            R12, R10                                                                        \
++  ADCQ            $0, R10                                 /* t2 += CF */                          \
++  MOVQ            k0, R13                                                                         \
++  IMULQ           acc, R13                                /* acc * k0 */                          \
++  ANDQ            mask52, R13                             /* yi = (acc * k0) & mask52 */          \
++  VPBROADCASTQ    R13, Yi                                 /* broadcast y[i] */                    \
++  MOVQ            (dataOffset)(m), DX                                                             \
++  MULXQ           R13, R13, R12                           /* yi * m[0] = (t0,t1) */               \
++  ADDQ            R13, acc                                /* acc += t0 */                         \
++  ADCQ            R12, R10                                /* t2 += (t1 + CF) */                   \
++  SHRQ            $52, acc                                                                        \ 
++  SALQ            $12, R10                                                                        \
++  ORQ             R10, acc                                /* acc = ((acc >> 52) | (t2 << 12)) */  \
++                                                                                                  \
++  VPMADD52LUQ     (dataOffset+0)(a), Bi, R0                                                       \
++  VPMADD52LUQ     (dataOffset+32)(a), Bi, R0h                                                     \
++  VPMADD52LUQ     (dataOffset+64)(a), Bi, R1                                                      \
++  VPMADD52LUQ     (dataOffset+96)(a), Bi, R1h                                                     \
++  VPMADD52LUQ     (dataOffset+128)(a), Bi, R2                                                     \
++  VPMADD52LUQ     (dataOffset+0)(m), Yi, R0                                                       \
++  VPMADD52LUQ     (dataOffset+32)(m), Yi, R0h                                                     \
++  VPMADD52LUQ     (dataOffset+64)(m), Yi, R1                                                      \
++  VPMADD52LUQ     (dataOffset+96)(m), Yi, R1h                                                     \
++  VPMADD52LUQ     (dataOffset+128)(m), Yi, R2                                                     \ 
++                                                                                                  \
++  /* Shift accumulators right by 1 qword, zero extending the highest one */                       \   
++  VALIGNQ         $1, R0, R0h, R0                                                                 \
++  VALIGNQ         $1, R0h, R1, R0h                                                                \
++  VALIGNQ         $1, R1, R1h, R1                                                                 \
++  VALIGNQ         $1, R1h, R2, R1h                                                                \
++  VALIGNQ         $1, R2, zero, R2                                                                \
++  VMOVQ           R0x, R13                                                                        \
++  ADDQ            R13, acc                                /* acc += R0[0] */                      \
++                                                                                                  \
++  VPMADD52HUQ     (dataOffset+0)(a), Bi, R0                                                       \
++  VPMADD52HUQ     (dataOffset+32)(a), Bi, R0h                                                     \
++  VPMADD52HUQ     (dataOffset+64)(a), Bi, R1                                                      \
++  VPMADD52HUQ     (dataOffset+96)(a), Bi, R1h                                                     \
++  VPMADD52HUQ     (dataOffset+128)(a), Bi, R2                                                     \
++  VPMADD52HUQ     (dataOffset+0)(m), Yi, R0                                                       \
++  VPMADD52HUQ     (dataOffset+32)(m), Yi, R0h                                                     \
++  VPMADD52HUQ     (dataOffset+64)(m), Yi, R1                                                      \
++  VPMADD52HUQ     (dataOffset+96)(m), Yi, R1h                                                     \
++  VPMADD52HUQ     (dataOffset+128)(m), Yi, R2
++
++// transform to normalized bignum qwords and handle carry bits
++#define amm52x20_x1_norm(acc, R0, R0h, R1, R1h, R2) \
++  /* Put accumulator to low qword in R0 */                                                        \
++  VPBROADCASTQ    acc, T0                                                                         \
++  VPBLENDD        $3, T0, R0, R0                                                                  \
++                                                                                                  \
++  /* Extract "carries" (12 high bits) from each QW of R0..R2 */                                   \
++  /* Save them to LSB of QWs in T0..T2 */                                                         \
++  VPSRLQ          $52, R0, T0                                                                     \
++  VPSRLQ          $52, R0h, T0h                                                                   \
++  VPSRLQ          $52, R1, T1                                                                     \
++  VPSRLQ          $52, R1h, T1h                                                                   \
++  VPSRLQ          $52, R2, T2                                                                     \
++                                                                                                  \
++  /* "Shift left" T0..T2 by 1 QW */                                                               \
++  VALIGNQ         $3, T1h, T2, T2                                                                 \
++  VALIGNQ         $3, T1, T1h, T1h                                                                \
++  VALIGNQ         $3, T0h, T1, T1                                                                 \
++  VALIGNQ         $3, T0, T0h, T0h                                                                \
++  VALIGNQ         $3, zeros<>(SB), T0, T0                                                         \
++                                                                                                  \
++  /* Drop "carries" from R0..R2 QWs */                                                            \
++  VPANDQ          mask52x4<>(SB), R0, R0                                                          \
++  VPANDQ          mask52x4<>(SB), R0h, R0h                                                        \
++  VPANDQ          mask52x4<>(SB), R1, R1                                                          \
++  VPANDQ          mask52x4<>(SB), R1h, R1h                                                        \
++  VPANDQ          mask52x4<>(SB), R2, R2                                                          \
++                                                                                                  \
++  /* Sum R0..R2 with corresponding adjusted carries */                                            \
++  VPADDQ          T0, R0, R0                                                                      \
++  VPADDQ          T0h, R0h, R0h                                                                   \
++  VPADDQ          T1, R1, R1                                                                      \
++  VPADDQ          T1h, R1h, R1h                                                                   \
++  VPADDQ          T2, R2, R2                                                                      \
++                                                                                                  \
++  /* Now handle carry bits from this addition */                                                  \
++  /* Get mask of QWs which 52-bit parts overflow... */                                            \
++  VPCMPUQ         $6, mask52x4<>(SB), R0,  K1                   /* OP=nle (i.e. gt) */            \
++  VPCMPUQ         $6, mask52x4<>(SB), R0h, K2                                                     \
++  VPCMPUQ         $6, mask52x4<>(SB), R1,  K3                                                     \
++  VPCMPUQ         $6, mask52x4<>(SB), R1h, K4                                                     \
++  VPCMPUQ         $6, mask52x4<>(SB), R2,  K5                                                     \
++  KMOVB           K1, R14                                       /* k1 */                          \
++  KMOVB           K2, R13                                       /* k1h */                         \
++  KMOVB           K3, R12                                       /* k2 */                          \
++  KMOVB           K4, R11                                       /* k2h */                         \
++  KMOVB           K5, R10                                       /* k3 */                          \
++                                                                                                  \
++  /* ...or saturated */                                                                           \
++  VPCMPUQ         $0, mask52x4<>(SB), R0,  K1                   /* OP=eq */                       \
++  VPCMPUQ         $0, mask52x4<>(SB), R0h, K2                                                     \
++  VPCMPUQ         $0, mask52x4<>(SB), R1,  K3                                                     \
++  VPCMPUQ         $0, mask52x4<>(SB), R1h, K4                                                     \
++  VPCMPUQ         $0, mask52x4<>(SB), R2,  K5                                                     \
++  KMOVB           K1, R9                                        /* k4 */                          \
++  KMOVB           K2, R8                                        /* k4h */                         \
++  KMOVB           K3, BX                                        /* k5 */                          \
++  KMOVB           K4, CX                                        /* k5h */                         \
++  KMOVB           K5, DX                                        /* k6 */                          \
++                                                                                                  \
++  /* Get mask of QWs where carries shall be propagated to. */                                     \
++  /* Merge 4-bit masks to 8-bit values to use add with carry. */                                  \
++  SHLB            $4, R13                                                                         \
++  ORB             R13, R14                                                                        \
++  SHLB            $4, R11                                                                         \
++  ORB             R11, R12                                                                        \
++  ADDB            R14, R14                                                                        \
++  ADCB            R12, R12                                                                        \
++  ADCB            R10, R10                                                                        \              
++  SHLB            $4, R8                                                                          \
++  ORB             R8, R9                                                                          \
++  SHLL            $4, CX                                                                          \
++  ORL             CX, BX                                                                          \
++  ADDB            R9, R14                                                                         \
++  ADCB            BX, R12                                                                         \
++  ADCB            DX, R10                                                                         \
++  XORB            R9, R14                                                                         \
++  XORL            BX, R12                                                                         \
++  XORL            DX, R10                                                                         \
++  KMOVB           R14, K1                                                                         \
++  SHRB            $4, R14                                                                         \
++  KMOVB           R14, K2                                                                         \
++  KMOVB           R12, K3                                                                         \
++  SHRB            $4, R12                                                                         \
++  KMOVB           R12, K4                                                                         \
++  KMOVB           R10, K5                                                                         \
++                                                                                                  \
++  /* Add carries according to the obtained mask */                                                \
++  VPSUBQ          mask52x4<>(SB), R0, K1, R0                                                      \
++  VPSUBQ          mask52x4<>(SB), R0h, K2, R0h                                                    \
++  VPSUBQ          mask52x4<>(SB), R1, K3, R1                                                      \
++  VPSUBQ          mask52x4<>(SB), R1h, K4, R1h                                                    \
++  VPSUBQ          mask52x4<>(SB), R2, K5, R2                                                      \
++  VPANDQ          mask52x4<>(SB), R0, R0                                                          \
++  VPANDQ          mask52x4<>(SB), R0h, R0h                                                        \
++  VPANDQ          mask52x4<>(SB), R1, R1                                                          \
++  VPANDQ          mask52x4<>(SB), R1h, R1h                                                        \
++  VPANDQ          mask52x4<>(SB), R2, R2
++   
++TEXT ·amm_52x20_x1_ifma256(SB),0,$0-40
++  
++  // get base pointers for res, a, b, m ([]big.Word)
++  MOVQ                _res+0(FP), res                   
++  MOVQ                _a+8(FP), a                    
++  MOVQ                _b+16(FP), b                  
++  MOVQ                _m+24(FP), m
++
++  // get k0 ([]big.Word)
++  MOVQ			          _k0+32(FP), k0x                
++
++  // zero the accumulators
++  VPXORD              zero, zero, zero
++  VMOVDQA64           zero, R0_0
++  VMOVDQA64           zero, R0_0h
++  VMOVDQA64           zero, R1_0
++  VMOVDQA64           zero, R1_0h
++  VMOVDQA64           zero, R2_0
++
++  XORL                acc0_0, acc0_0
++  MOVQ                b, b_ptr                        
++  MOVQ                $0xfffffffffffff, mask52        // 52-bit mask
++
++  // Loop over 20 digits unrolled by 10
++  MOVQ                $2, iter
++
++  loop:
++    amm52x20_x1       ( 0, 0, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 8, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 16, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 24, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 32, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 40, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 48, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 56, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 64, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    amm52x20_x1       ( 0, 72, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, k0x )
++    LEAQ              (80)(b_ptr), b_ptr
++    DECQ              iter
++    JNE               loop
++  
++  amm52x20_x1_norm    (acc0_0, R0_0, R0_0h, R1_0, R1_0h, R2_0)
++  
++  VMOVDQU32           R0_0, (0)(res)
++  VMOVDQU32           R0_0h, (32)(res)
++  VMOVDQU32           R1_0, (64)(res)
++  VMOVDQU32           R1_0h, (96)(res)
++  VMOVDQU32           R2_0, (128)(res)
++  VZEROUPPER
++  RET
++
++// ###############################################################################
++// # amm52x20_x2_ifma256( res, a, b, m *big.Word, k0 [2]uint64 )
++// #
++// # Dual Almost Montgomery Multiplication for 20-digit number in radix 2^52
++// # does two AMMs for two independent inputs, hence dual.
++// #
++// # derived from similar AMM implementation in openSSL crypto rsa bn libraries
++// ###############################################################################
++TEXT ·amm_52x20_x2_ifma256(SB),0,$0-40
++  
++  MOVQ                  _out+0(FP), res                 
++  MOVQ                  _a+8(FP), a                    
++  MOVQ                  _b+16(FP), b                  
++  MOVQ                  _m+24(FP), m
++  MOVQ			            _k0+32(FP), k0x                      
++
++  // zero accumulators
++  VPXORD                zero, zero, zero
++  VMOVDQA64             zero, R0_0
++  VMOVDQA64             zero, R0_0h
++  VMOVDQA64             zero, R1_0
++  VMOVDQA64             zero, R1_0h
++  VMOVDQA64             zero, R2_0
++  VMOVDQA64             zero, R0_1
++  VMOVDQA64             zero, R0_1h
++  VMOVDQA64             zero, R1_1
++  VMOVDQA64             zero, R1_1h
++  VMOVDQA64             zero, R2_1
++  XORL                  acc0_0, acc0_0
++  XORL                  acc0_1, acc0_1
++
++  // init pointer, mask, and loop count
++  MOVQ                  b, b_ptr                                                        
++  MOVQ                  $0xfffffffffffff, mask52       
++
++  // Loop over 2 x 20 digits unrolled by 2
++  MOVQ                  $10, iter
++
++  loop10:
++    amm52x20_x1         (   0,   0, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, (0)(k0x) )
++    amm52x20_x1         ( 160, 160, acc0_1, R0_1, R0_1x, R0_1h, R1_1, R1_1h, R2_1, (8)(k0x) )
++    amm52x20_x1         (   0,   8, acc0_0, R0_0, R0_0x, R0_0h, R1_0, R1_0h, R2_0, (0)(k0x) )
++    amm52x20_x1         ( 160, 168, acc0_1, R0_1, R0_1x, R0_1h, R1_1, R1_1h, R2_1, (8)(k0x) )
++    LEAQ                (16)(b_ptr), b_ptr
++    DECQ                iter
++    JNE                 loop10
++
++  amm52x20_x1_norm      ( acc0_0, R0_0, R0_0h, R1_0, R1_0h, R2_0 )
++  amm52x20_x1_norm      ( acc0_1, R0_1, R0_1h, R1_1, R1_1h, R2_1 )
++
++  VMOVDQU64             R0_0, (0*32)(res)
++  VMOVDQU64             R0_0h, (1*32)(res)
++  VMOVDQU64             R1_0, (2*32)(res)
++  VMOVDQU64             R1_0h, (3*32)(res)
++  VMOVDQU64             R2_0, (4*32)(res)
++  VMOVDQU64             R0_1, (5*32)(res)
++  VMOVDQU64             R0_1h, (6*32)(res)
++  VMOVDQU64             R1_1, (7*32)(res)
++  VMOVDQU64             R1_1h, (8*32)(res)
++  VMOVDQU64             R2_1, (9*32)(res)
++  VZEROUPPER
++  RET
++
++// ######################################################################################
++// # extract_mul_2x20_win5( res, table *big.Word, i1, i2 int )
++// #
++// # constant time extraction from the precomputed table of powers base^i, where
++// #   i = 0..2^EXP_WIN_SIZE-1
++// # the input |table| contains precomputations for two independent base values.
++// # |idx1| and |idx2| are corresponding power indexes.
++// # the extracted value (output) is 2 20 digit numbers in 2^52 radix.
++// # table is of size [2][32][20]
++// #
++// # derived from ossl_extract_multiplier_2x20_win5() in openSSL crypto rsa bn libraries
++//#######################################################################################
++#define out     DI
++#define table   SI
++#define idx1r   DX
++#define idx2r   CX
++#define t0      Y0
++#define t0x     X0
++#define t1      Y1
++#define t2      Y2
++#define t3      Y3
++#define t4      Y4
++#define t5      Y5
++#define t6      Y16
++#define t7      Y17
++#define t8      Y18
++#define t9      Y19
++#define tmp     Y20
++#define idx     Y21
++#define idx1    Y22
++#define idx2    Y23
++#define one     Y24
++
++#define vextract(i, dst, m) \
++  VMOVDQU64         (i*32)(table), tmp      /* load table entry */                      \
++  VPBLENDMQ         tmp, dst, m, dst        /* extract data when mask is not zero */
++
++TEXT ·extract_mul_2x20_win5(SB),0,$0-32
++  
++  // get base pointers for res, a, b, m ([]big.Word)
++  MOVQ                _res+0(FP), res                   
++  MOVQ                _table+8(FP), table                    
++  MOVQ                i1+16(FP), idx1r
++  MOVQ                i2+24(FP), idx2r
++
++  // broadcast ones and index values
++  VMOVDQA64           ones<>(SB), one         
++  VPBROADCASTQ        idx1r, idx1
++  VPBROADCASTQ        idx2r, idx2
++
++  // point AX to end of the tbl (base + (1<<5)*2*20*8)
++  LEAQ                (10240)(table), AX  
++
++  // zero t0..n, cur_idx
++  VPXOR               t0x, t0x, t0x
++  VMOVDQA64           t0, idx
++  VMOVDQA64           t0, t1
++  VMOVDQA64           t0, t2
++  VMOVDQA64           t0, t3
++  VMOVDQA64           t0, t4
++  VMOVDQA64           t0, t5
++  VMOVDQA64           t0, t6
++  VMOVDQA64           t0, t7
++  VMOVDQA64           t0, t8
++  VMOVDQA64           t0, t9
++
++loop:
++  VPCMPQ              $0, idx, idx1, K1       // mask (idx1 == idx)
++  VPCMPQ              $0, idx, idx2, K2       // mask (idx2 == idx)
++  vextract            (0, t0, K1)
++  vextract            (1, t1, K1)
++  vextract            (2, t2, K1)
++  vextract            (3, t3, K1)
++  vextract            (4, t4, K1)
++  vextract            (5, t5, K2)
++  vextract            (6, t6, K2)
++  vextract            (7, t7, K2)
++  vextract            (8, t8, K2)
++  vextract            (9, t9, K2)
++  VPADDQ              one, idx, idx          
++  ADDQ                $320, table
++  CMPQ                table, AX
++  JNE                 loop
++
++  VMOVDQU64           t0, (0*32)(out)
++  VMOVDQU64           t1, (1*32)(out)
++  VMOVDQU64           t2, (2*32)(out)
++  VMOVDQU64           t3, (3*32)(out)
++  VMOVDQU64           t4, (4*32)(out)
++  VMOVDQU64           t5, (5*32)(out)
++  VMOVDQU64           t6, (6*32)(out)
++  VMOVDQU64           t7, (7*32)(out)
++  VMOVDQU64           t8, (8*32)(out)
++  VMOVDQU64           t9, (9*32)(out)
++  RET
++
++// ######################################################################################
++// # bn_reduce_once_in_place_16( z, a, b *big.Word )
++// # 
++// # z[i] = c & a[i] | ~c & (a[i]-b[i]) for i=0,1,2,...15, where c = carry out
++//#######################################################################################
++#undef    a 
++#undef    b 
++#define   z       SI
++#define   a       DI
++#define   b       R8
++#define   o       R8
++#define   c       R9 
++#define   selA    R9
++#define   selB    R10
++#define   x       R11
++
++// element-wise subtract w/ carry prop
++#define   bnSubWord(i) \
++  MOVQ            (8*i)(a), c                     /* c = a[i] */                          \
++  SBBQ            (8*i)(b), c                     /* c = a[i]-b[i] w/ borrow */           \
++  MOVQ            c, (8*i)(z)                     /* z[i] = a[i]-b[i] w/ borrow */
++
++// select constant time
++#define   bnSelWordCT(i) \
++  MOVQ            (8*i)(a), o                     /* o = a */                             \
++  MOVQ            (8*i)(z), x                     /* x = (a-b) */                         \     
++  ANDQ            selA, o                         /* o = mask & a */                      \
++  ANDQ            selB, x                         /* x = ~mask & (a-b) */                 \
++  ORQ             x, o                            /* out = mask & a | ~mask & (a-b) */    \
++  MOVQ            o, (8*i)(z)
++
++TEXT ·bn_reduce_once_in_place_16(SB),0,$0-32
++  MOVQ            _z+0(FP), z
++  MOVQ            _a+8(FP), a
++  MOVQ            _b+16(FP), b
++  SUBQ            c, c                            // clear carry 
++  bnSubWord       (0)                             // out[i] = a[i]-b[i] with borrow for 0 <= i < 16
++  bnSubWord       (1)                             // unrolled
++  bnSubWord       (2)                      
++  bnSubWord       (3)                      
++  bnSubWord       (4)                      
++  bnSubWord       (5)                      
++  bnSubWord       (6)                      
++  bnSubWord       (7)                      
++  bnSubWord       (8)                      
++  bnSubWord       (9)                      
++  bnSubWord       (10)                      
++  bnSubWord       (11)                      
++  bnSubWord       (12)                      
++  bnSubWord       (13)                      
++  bnSubWord       (14)                      
++  bnSubWord       (15)                      
++  SBBQ            c, c                            // propogate carry (c = c-c+CF = 0xffffffffffffffff if CF=1 or 0 if CF=0)
++  MOVQ            selA, selB
++  NOTQ            selB                            // selB = ~selA            
++  bnSelWordCT     (0)                             // constant time select
++  bnSelWordCT     (1)                             // out[i] = c & a[i] | ~c & (a[i]-b[i])                  
++  bnSelWordCT     (2)                             // unrolled
++  bnSelWordCT     (3)
++  bnSelWordCT     (4)
++  bnSelWordCT     (5)
++  bnSelWordCT     (6)
++  bnSelWordCT     (7)
++  bnSelWordCT     (8)
++  bnSelWordCT     (9)
++  bnSelWordCT     (10)
++  bnSelWordCT     (11)
++  bnSelWordCT     (12)
++  bnSelWordCT     (13)
++  bnSelWordCT     (14)
++  bnSelWordCT     (15)
++  MOVQ            selA, ret+24(FP)                // return selection mask
++  RET
++
++// ######################################################################################
++// # bn_mul_mont( r, a, b, n *big.Word, n0 *uint64, num uint64 )
++// #
++// # big number Montgomery multiplication, r = a * b, with modulus n
++// # for up to 2048-bit operands [32]big.Word, num=32
++// #
++// # derived from bn_mul_mont() in the OpenSSL crypto rsa bn libraries
++// #######################################################################################
++#undef a       
++#undef b       
++#define r       DI
++#define a       SI
++#define b       R12
++#define n       CX
++#define n0      R8
++#define num     R9
++#define lo0     R10
++#define hi0     R11
++#define hi1     R13
++#define i       R14
++#define j       R15
++#define m0      BX
++#define m1      BP
++
++#define l1entry(idx) \
++	MULQ	          m0			                          /* a[j]*b[0] */                   \
++	ADDQ	          AX, hi0                                                             \
++	MOVQ	          (idx*8)(n), AX                                                      \
++	ADCQ	          $0, DX                                                              \
++	MOVQ	          DX, lo0                                                             \
++	MULQ	          m1			                          /* n[j]*m1 */   
++
++#define l1main(idx) \
++	ADDQ	          AX, hi1                                                             \
++	MOVQ	          (idx*8)(a), AX                                                      \
++	ADCQ	          $0, DX                                                              \
++	ADDQ	          hi0, hi1		                      /* n[j]*m1 + a[j]*b[0] */         \
++	MOVQ	          lo0, hi0                                                            \
++	ADCQ	          $0, DX                                                              \
++  MOVQ	          hi1, (-16+idx*8)(SP)	            /* t[j-1] */                      \
++	MOVQ	          DX, hi1                                                             \
++  l1entry         (idx)
++
++#define bmmentry \
++	MULQ	          m0			                          /* a[j]*b[i] */                   \
++	ADDQ	          AX, hi0                                                             \
++	MOVQ	          (n)(j*8), AX                                                        \
++	ADCQ	          $0, DX                                                              \
++	ADDQ	          hi0, lo0		                      /* a[j]*b[i]+t[j] */              \
++	MOVQ	          DX, hi0                                                             \
++	ADCQ	          $0, hi0                                                             \
++	LEAQ	          (1)(j), j		                      /* j++ */                         \
++	MULQ	          m1			                          /* n[j]*m1 */  
++
++#define bmmmain \
++	ADDQ	          AX, hi1                                                             \
++	MOVQ	          (a)(j*8), AX                                                        \
++	ADCQ	          $0, DX                                                              \
++	ADDQ	          lo0, hi1		                      /* n[j]*m1 + a[j]*b[i] + t[j] */  \
++	MOVQ	          (SP)(j*8), lo0                                                      \
++	ADCQ	          $0, DX                                                              \
++	MOVQ	          hi1, (-16)(SP)(j*8)	              /* t[j-1] */                      \
++	MOVQ	          DX, hi1                                                             \
++  bmmentry
++
++#define bmm_sub(idx) \	
++  SBBQ	          (idx*8)(n), AX                                                      \
++	MOVQ	          AX, (idx*8)(r)		                /* r[i] = t[i] - n[i] */          \
++	MOVQ	          (8+idx*8)(SP), AX	                /* t[i+1] */                      
++
++TEXT ·bn_mul_mont(SB),0,$256-48
++  MOVQ            _r+0(FP), r
++  MOVQ            _a+8(FP), a
++  MOVQ            _b+16(FP), b
++  MOVQ            _n+24(FP), n
++  MOVQ            _n0+32(FP), n0
++  MOVQ            _num+40(FP), num 
++  PUSHQ           BP                                // bp used for m1
++	MOVQ	          (n0), n0		                      // pull n0[0]
++	MOVQ	          (b), m0		                        // m0 = b[0]
++	MOVQ	          (a), AX
++	XORQ	          i, i			                        // i = 0
++	MOVQ	          n0, m1
++	MULQ	          m0			                          // a[0] * b[0]
++	MOVQ	          AX, lo0
++	MOVQ	          (n), AX
++	IMULQ	          lo0, m1		                        // "t[0]" * n0
++	MOVQ	          DX, hi0
++	MULQ	          m1			                          // n[0] * m1
++	ADDQ	          AX, lo0		                        // discarded
++	MOVQ	          (8)(a), AX
++	ADCQ	          $0, DX
++	MOVQ	          DX, hi1
++  l1entry         (1)
++  l1main          (2)
++  l1main          (3)
++  l1main          (4)
++  l1main          (5)
++  l1main          (6)
++  l1main          (7)
++  l1main          (8)
++  l1main          (9)
++  l1main          (10)
++	ADDQ	          AX, hi1
++	MOVQ	          (a), AX		                        // a[0]
++	ADCQ	          $0, DX
++	ADDQ	          hi0, hi1		                      // n[j]*m1 + a[j]*b[0]
++	ADCQ	          $0, DX
++  MOVQ	          hi1, (-16+88)(SP)	                // t[j-1]
++  MOVQ	          DX, hi1
++	MOVQ	          lo0, hi0
++	XORQ	          DX, DX
++	ADDQ	          hi0, hi1
++	ADCQ	          $0, DX
++	MOVQ	          hi1, (-8+88)(SP)
++	MOVQ	          DX, (88)(SP)	                    // store upmost overflow bit
++	LEAQ	          (1)(i), i		                      // i++
++
++bmm_outer:
++	MOVQ	          (b)(i*8), m0		                  // m0 = b[i]
++	XORQ	          j, j			                        // j = 0
++	MOVQ	          n0, m1
++	MOVQ	          (SP), lo0
++	MULQ	          m0			                          // a[0]*b[i]
++	ADDQ	          AX, lo0		                        // a[0]*b[i]+t[0]
++	MOVQ	          (n), AX
++	ADCQ	          $0, DX
++	IMULQ	          lo0, m1		                        // t[0]*n0
++	MOVQ	          DX, hi0
++	MULQ	          m1			                          // n[0]*m1
++	ADDQ	          AX, lo0		                        // discarded
++	MOVQ	          (8)(a), AX
++	ADCQ	          $0, DX
++	MOVQ	          (8)(SP), lo0		                  // t[1]
++	MOVQ          	DX, hi1
++  LEAQ	          (1)(j), j		                      // j++
++  bmmentry
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++  bmmmain
++	ADDQ	          AX, hi1
++	MOVQ	          (a), AX		                        // a[0]
++	ADCQ	          $0, DX
++	ADDQ  	        lo0, hi1		                      // n[j]*m1 + a[j]*b[i] + t[j]
++	MOVQ	          (SP)(j*8), lo0
++	ADCQ	          $0,DX
++	MOVQ	          hi1, (-16)(SP)(j*8)	              // t[j-1]
++	MOVQ	          DX, hi1
++	XORQ	          DX, DX
++	ADDQ	          hi0, hi1
++	ADCQ	          $0, DX
++	ADDQ	          lo0, hi1		                      // pull upmost overflow bit
++	ADCQ	          $0, DX
++	MOVQ	          hi1, (-8)(SP)(num*8)
++	MOVQ	          DX, (SP)(num*8)	                  // store upmost overflow bit
++	LEAQ	          (1)(i), i		                      // i++
++	CMPQ	          i, num
++	JB	            bmm_outer
++  MOVQ	          (SP), AX		                      // t[0]
++  bmm_sub         (0)
++  bmm_sub         (1)
++  bmm_sub         (2)
++  bmm_sub         (3)
++  bmm_sub         (4)
++  bmm_sub         (5)
++  bmm_sub         (6)
++  bmm_sub         (7)
++  bmm_sub         (8)
++  bmm_sub         (9)
++  bmm_sub         (10)
++	SBBQ	          $0, AX		                        // handle upmost overflow bit
++	MOVQ	          $-1, BX
++	XORQ	          AX, BX		                        // not AX
++	XORQ	          i, i
++	MOVQ	          num, j			                      // j = num
++
++bmm_copy:					                                  // conditional copy
++	MOVQ	          (r)(i*8), CX
++	MOVQ	          (SP)(i*8), DX
++	ANDQ	          BX, CX
++	ANDQ	          AX, DX
++	MOVQ	          num, (SP)(i*8)	                  // zap temporary vector
++	ORQ	            CX, DX
++	MOVQ	          DX, (r)(i*8)		                  // r[i] = t[i]
++	LEAQ	          1(i), i
++	SUBQ	          $1, j
++	JNZ	            bmm_copy 
++  POPQ            BP
++  RET
++
++// ######################################################################################
++// # bn_from_mont( bn, r, N *big.Word, n0 uint64, num uint64 )
++// #
++// # convert from montgomery representation to big number, i.e., bn = r mod n
++// # for up to 2048-bit operands [32]big.Word, num=32
++// #
++// # derived from BN_from_montgomery() in the OpenSSL crypto rsa bn libraries
++// #######################################################################################
++#undef r      
++#undef a  
++#undef x
++#undef n       
++#undef n0      
++#undef num     
++#undef lo0     
++#undef hi0     
++#undef hi1     
++#undef i       
++#undef j       
++#undef m0     
++#undef m1      
++#undef b
++#undef zero
++#define bn        DI
++#define r         SI
++#define n         CX
++#define lo        AX
++#define hi        DX
++#define n0        BX
++#define num       R8
++#define w         R9
++#define c1        R10
++#define v         R10
++#define b         R10
++#define i         R11
++#define carry     R12
++#define t         R13
++#define x         R14
++#define j         R15
++
++TEXT ·bn_from_mont(SB),0,$0-40
++  MOVQ            _bn+0(FP), bn
++  MOVQ            _r+8(FP), r
++  MOVQ            _n+16(FP), n
++  MOVQ            _n0+24(FP), n0
++  MOVQ            _num+32(FP), num
++  XORQ            carry, carry
++  MOVQ            num, j
++
++// add multiples of |n| to |r| until R = 2^(nl * 64) divides it. on
++// input, we had |r| < |n| * R, so now |r| < 2 * |n| * R. Note that |r|
++// includes |carry| which is stored separately.
++bnfm_outer:
++  MOVQ            n0, lo
++  MULQ            (r)               // w = rp[0] * n0 
++  MOVQ            lo, w
++  XORQ            c1, c1
++  XORQ            i, i
++  XORQ            x, x
++
++bnfm_inner:
++  MOVQ            w, lo
++  MULQ            (n)(i*8)          // hi(DX):lo(AX) = w(AX) * n[i] 
++  ADDQ            lo, c1
++  ADCQ            $0, hi
++  ADDQ            c1, (r)(i*8)
++  ADCQ            $0, hi
++  MOVQ            hi, c1
++  ADDQ            $1, i
++  CMPQ            i, num
++  JNE             bnfm_inner
++  MOVQ            (r)(num*8), t
++  ADDQ            t, v              
++  ADDQ            carry, v          // v = v + rp[nl] + carry
++  CMPQ            v, t
++  SETNE           t
++  SETLS           x
++  ANDQ            $1, t
++  ORQ             t, carry          // carry |= (v != rp[nl])
++  ANDQ            x, carry          // carry &= (v <= rp[nl])
++  MOVQ            v, (r)(num*8)     // rp[nl] = v
++  ADDQ            $8, r
++  SUBQ            $1, j
++  JNZ             bnfm_outer
++
++  // shift |nl| words to divide by R. We have |ap| < 2 * |n|. Note that |ap|
++  // includes |carry| which is 
++  // stored separately
++  MOVQ            _r+8(FP), r       // restore r
++  MOVQ            num, t
++  SHLQ            $3, t
++  ADDQ            t, r              // r -> r[num] (r += 8*num)
++  XORQ            i, i              // i = 0
++  SUBQ            b, b              // clear borrow
++  MOVQ            num, t
++
++bnfm_sub:
++  MOVQ            (r)(i*8), b
++  SBBQ            (n)(i*8), b
++  MOVQ            b, (bn)(i*8)
++  LEAQ            (1)(i), i
++  DECQ            t
++  JNZ             bnfm_sub
++  SBBQ            b, b
++  ANDQ            $1, b
++  SUBQ            b, carry
++
++bnfm_select:
++  // |carry| is -1 if |ap| - |np| underflowed or zero if it did not. Note
++  // |carry| cannot be 1. That would imply the subtraction did not fit in
++  // |nl| words, and we know at most one subtraction is needed.
++  CMPQ            carry, $0
++  JEQ             bnfm_exit
++  XORQ            i, i
++
++bnfm_copy:
++  MOVQ            (r)(i*8), t
++  MOVQ            t, (bn)(i*8)
++  LEAQ            (1)(i), i
++  CMPQ            i, num
++  JNE             bnfm_copy
++
++bnfm_exit:
++  RET
++
++// ######################################################################################
++// # bn_mul_mont_16( r, a, b, n *big.Word, n0 *uint64 )
++// #
++// # big number Montgomery multiplication, r = a * b, with modulus n
++// # for 1024-bit operands [16]big.Word, uses 128 bytes of stack space (16x8)
++// #
++// # derived from bn_mul_mont() in the OpenSSL crypto rsa bn libraries
++// #######################################################################################
++#undef bn
++#undef b
++#undef r
++#undef n
++#undef lo
++#undef hi
++#undef n0
++#undef num
++#undef w
++#undef c1
++#undef v
++#undef i
++#undef carry
++#undef t
++#undef x
++#undef j
++#define   n0      R8 
++#define   mi      R8
++#define   bi      R9
++#define   num     AX
++#define   b       DX
++#define   tptr    BX
++#define   aptr    SI
++#define   rp      DI
++#define   bptr    DI
++#define   nptr    CX
++#define   zero    BP
++
++TEXT ·bn_mul_mont_16(SB),0,$256-40
++  MOVQ            _r+0(FP), rp
++  MOVQ            _a+8(FP), aptr
++  MOVQ            _b+16(FP), b
++  MOVQ            _n+24(FP), nptr
++  MOVQ            _n0+32(FP), n0
++  PUSHQ           BP
++  LEAQ	          (128)(b), R10
++	MOVQ	          R10, 16(SP)		                  // save &(b[16])
++	MOVQ	          n0, 24(SP)		                  // save *n0
++	MOVQ	          rp, 32(SP)		                  // save *rp
++  MOVQ	          $3, 48(SP)		                  // inner counter
++	LEAQ	          (8)(b), bptr
++	MOVQ	          (b), b		                      // b[0]
++  LEAQ	          64+32(SP), tptr
++	MOVQ	          DX, bi
++	MULXQ	          (0*8)(aptr), mi, AX	            // a[0]*b[0]
++	MULXQ	          (1*8)(aptr), R11, R14	          // a[1]*b[0]
++	ADDQ	          AX, R11
++  MOVQ	          bptr, 8(SP)		                  // save &b[i]
++	MULXQ	          (2*8)(aptr), R12, R13	          // a[2]*b[0]
++	ADCQ	          R14, R12
++	ADCQ	          $0, R13
++	MOVQ	          mi, bptr		                    // reuse bptr
++  IMULQ	          24(SP), mi		                  // "t[0]"*n0
++	XORQ	          zero, zero		                  // cf=0, of=0
++	MULXQ	          (3*8)(aptr), AX, R14            // a[3]*b[0]
++	MOVQ	          mi, DX
++	LEAQ	          (4*8)(aptr), aptr
++	ADCXQ	          AX, R13
++	ADCXQ	          zero, R14		                    // cf=0
++	MULXQ	          (0*8)(nptr), AX, R10            // n[0]*
++	ADCXQ	          AX, bptr		                    // discarded
++	ADOXQ	          R11, R10
++	MULXQ	          (1*8)(nptr), AX, R11            // n[1]*
++	ADCXQ	          AX, R10
++	ADOXQ	          R12, R11
++  MULXQ	          (2*8)(nptr), AX, R12
++	MOVQ	          48(SP), bptr		                // counter value
++	MOVQ	          R10, (-4*8)(tptr)
++	ADCXQ	          AX, R11
++	ADOXQ	          R13, R12
++	MULXQ	          (3*8)(nptr), AX, R15
++	MOVQ	          bi, DX
++	MOVQ	          R11, (-3*8)(tptr)
++	ADCXQ          	AX, R12
++	ADOXQ	          zero, R15		                    // of=0
++	LEAQ	          (4*8)(nptr), nptr
++	MOVQ	          R12,(-2*8)(tptr)
++
++bn_mont_mul_first:
++  ADCXQ	          zero, R15		                    // cf=0, modulo-scheduled
++	MULXQ	          (0*8)(aptr), R10, AX	          // a[4]*b[0]
++	ADCXQ	          R14, R10
++	MULXQ	          (1*8)(aptr), R11, R14	          // a[5]*b[0]
++	ADCXQ	          AX, R11
++	MULXQ	          (2*8)(aptr), R12, AX
++	ADCXQ	          R14, R12
++	MULXQ	          (3*8)(aptr), R13, R14
++	MOVQ	          mi, DX
++	ADCXQ	          AX, R13
++	ADCXQ	          zero, R14		                    // cf=0
++	LEAQ	          (4*8)(aptr), aptr
++	LEAQ	          (4*8)(tptr), tptr
++	ADOXQ	          R15, R10
++	MULXQ	          (0*8)(nptr), AX, R15
++	ADCXQ	          AX, R10
++	ADOXQ	          R15, R11
++	MULXQ	          (1*8)(nptr), AX, R15
++	ADCXQ	          AX, R11
++	ADOXQ	          R15, R12
++	MULXQ	          (2*8)(nptr), AX, R15
++	MOVQ  	        R10, (-5*8)(tptr)
++	ADCXQ	          AX, R12
++	MOVQ	          R11, (-4*8)(tptr)
++	ADOXQ	          R15, R13
++	MULXQ	          (3*8)(nptr), AX, R15
++	MOVQ	          bi, DX
++	MOVQ	          R12, (-3*8)(tptr)
++	ADCXQ	          AX, R13
++	ADOXQ	          zero, R15
++	LEAQ	          (4*8)(nptr), nptr
++	MOVQ	          R13, (-2*8)(tptr)
++	DECQ	          bptr			                    // of=0, pass cf
++	JNZ	            bn_mont_mul_first
++  MOVQ	          $128, num		                  // load num (bytes)
++	MOVQ	          (8)(SP), bptr                 // re-load &b[i]
++	ADCQ	          zero, R15		                  // modulo-scheduled
++	ADDQ	          R15, R14
++	SBBQ	          R15, R15		                  // top-most carry
++	MOVQ	          R14, (-1*8)(tptr)
++
++bn_mont_mul_outer:
++	MOVQ	          (bptr), DX		                // b[i]
++	LEAQ	          (8)(bptr), bptr		            // b++
++	SUBQ	          num, aptr		                  // rewind aptr
++	MOVQ	          R15, (tptr)		                // save top-most carry
++	LEAQ	          64+4*8(SP), tptr
++	SUBQ	          num, nptr		                  // rewind $nptr
++	MULXQ	          (0*8)(aptr), mi, R11	        // a[0]*b[i]
++	XORQ	          zero, zero		                // cf=0, of=0
++	MOVQ	          DX, bi
++	MULXQ	          (1*8)(aptr), R14, R12	        // a[1]*b[i]
++	ADOXQ	          (-4*8)(tptr), mi
++	ADCXQ	          R14, R11
++	MULXQ	          (2*8)(aptr), R15, R13
++	ADOXQ	          (-3*8)(tptr), R11
++	ADCXQ	          R15, R12
++	ADOXQ	          (-2*8)(tptr), R12
++	ADCXQ	          zero, R13
++	ADOXQ	          zero, R13
++	MOVQ	          bptr, (8)(SP)		              // off-load &b[i]
++	MOVQ	          mi, R15
++	IMULQ	          24(SP), mi                    // "t[0]"*n0
++	XORQ	          zero, zero 		                // cf=0, of=0
++	MULXQ	          (3*8)(aptr), AX, R14
++	MOVQ	          mi, DX
++	ADCXQ	          AX, R13
++	ADOXQ	          (-1*8)(tptr), R13
++	ADCXQ	          zero, R14
++	LEAQ	          (4*8)(aptr), aptr
++	ADOXQ 	        zero, R14
++	MULXQ	          (0*8)(nptr), AX, R10
++	ADCXQ	          AX, R15		                    // discarded
++	ADOXQ	          R11, R10
++	MULXQ	          (1*8)(nptr), AX, R11
++	ADCXQ	          AX, R10
++	ADOXQ	          R12, R11
++	MULXQ	          (2*8)(nptr), AX, R12
++	MOVQ            R10, (-4*8)(tptr)
++	ADCXQ	          AX, R11
++	ADOXQ	          R13, R12
++	MULXQ	          (3*8)(nptr), AX, R15
++  MOVQ	          bi, DX
++	MOVQ	          R11, (-3*8)(tptr)
++	LEAQ	          (4*8)(nptr), nptr
++	ADCXQ	          AX, R12
++	ADOXQ	          zero, R15		                  // of=0
++	MOVQ	          (48)(SP), bptr		            // counter value
++	MOVQ	          R12, (-2*8)(tptr)
++
++bn_mont_mul_inner:
++	MULXQ	          (0*8)(aptr), R10, AX	        // a[4]*b[i]
++	ADCXQ	          zero, R15		                  // cf=0, modulo-scheduled
++	ADOXQ	          R14, R10
++	MULXQ	          (1*8)(aptr), R11, R14	        // a[5]*b[i]
++	ADCXQ	          (0*8)(tptr), R10
++	ADOXQ	          AX, R11
++	MULXQ	          (2*8)(aptr), R12, AX
++	ADCXQ	          (1*8)(tptr), R11
++	ADOXQ	          R14, R12
++	MULXQ	          (3*8)(aptr), R13, R14
++	MOVQ	          mi, DX
++	ADCXQ	          (2*8)(tptr), R12
++	ADOXQ	          AX, R13
++	ADCXQ	          (3*8)(tptr), R13
++	ADOXQ	          zero, R14		                  // of=0
++	LEAQ	          (4*8)(aptr), aptr
++	LEAQ	          (4*8)(tptr), tptr
++	ADCXQ	          zero, R14		                  // cf=0
++	ADOXQ	          R15, R10
++	MULXQ	          (0*8)(nptr), AX, R15
++	ADCXQ	          AX, R10
++	ADOXQ	          R15, R11
++	MULXQ	          (1*8)(nptr), AX, R15
++	ADCXQ	          AX, R11
++	ADOXQ	          R15, R12
++	MULXQ	          (2*8)(nptr), AX,R15
++	MOVQ	          R10, (-5*8)(tptr)
++	ADCXQ	          AX, R12
++	ADOXQ	          R15, R13
++	MULXQ	          (3*8)(nptr), AX, R15
++	MOVQ	          bi, DX
++	MOVQ	          R11, (-4*8)(tptr)
++	MOVQ	          R12, (-3*8)(tptr)
++	ADCXQ	          AX, R13
++	ADOXQ	          zero, R15
++	LEAQ	          (4*8)(nptr), nptr
++	MOVQ	          R13, (-2*8)(tptr)
++	DECQ	          bptr			                    // of=0, pass cf
++	JNZ	            bn_mont_mul_inner
++	MOVQ	          $128, num		                  // load num
++	MOVQ	          (8)(SP), bptr		              // re-load &b[i]
++	ADCQ	          zero, R15		                  // modulo-scheduled
++	SUBQ	          (0*8)(tptr), zero	            // pull top-most carry
++	ADCQ	          R15, R14
++	SBBQ	          R15, R15		                  // top-most carry
++	MOVQ	          R14, (-1*8)(tptr)
++	CMPQ	          16(SP), bptr
++	JNE	            bn_mont_mul_outer
++	LEAQ	          (64)(SP), tptr
++	SUBQ	          num, nptr		                  // rewind $nptr
++	NEGQ	          R15
++	MOVQ	          num, DX
++	SHRQ	          $3+2, num		                  // cf=0
++	MOVQ	          (32)(SP), rp		              // restore rp
++
++bn_mont_mul_sub:
++	MOVQ	          (8*0)(tptr), R11
++	MOVQ	          (8*1)(tptr), R12
++	MOVQ	          (8*2)(tptr), R13
++	MOVQ  	        (8*3)(tptr), R14
++	LEAQ	          (8*4)(tptr), tptr
++	SBBQ	          (8*0)(nptr), R11
++	SBBQ	          (8*1)(nptr), R12
++	SBBQ	          (8*2)(nptr), R13
++	SBBQ	          (8*3)(nptr), R14
++	LEAQ	          (8*4)(nptr), nptr
++	MOVQ	          R11, (8*0)(rp)
++	MOVQ	          R12, (8*1)(rp)
++	MOVQ	          R13, (8*2)(rp)
++	MOVQ	          R14, (8*3)(rp)
++	LEAQ	          (8*4)(rp), rp
++	DECQ	          num			                      // preserves %cf
++	JNZ	            bn_mont_mul_sub
++	SBBQ	          $0, R15		                    // top-most carry
++	LEAQ	          (64)(SP), tptr
++	SUBQ	          DX, rp		                    // rewind rp
++	MOVQ	          R15, X1
++	PXOR	          X0, X0
++	PSHUFD	        $0, X1, X1
++
++bn_mont_mul_cond_copy:
++	VMOVDQU	        (16*0)(tptr), X2
++	VMOVDQU	        (16*1)(tptr), X3
++	LEAQ	          (16*2)(tptr), tptr
++	VMOVDQU	        (16*0)(rp), X4
++	VMOVDQU	        (16*1)(rp), X5
++	LEAQ	          (16*2)(rp), rp
++	VMOVDQU	        X0, (-16*2)(tptr)	            // zero tp
++	VMOVDQU	        X0, (-16*1)(tptr)
++	VPCMPEQD	      X1, X0, X0
++	PAND	          X1, X2
++	PAND	          X1, X3
++	PAND  	        X0, X4
++	PAND	          X0, X5
++	PXOR	          X0, X0
++	POR	            X2, X4
++	POR	            X3, X5
++	VMOVDQU	        X4, (-16*2)(rp)
++	VMOVDQU	        X5, (-16*1)(rp)
++	SUBQ	          $32, DX
++	JNZ	            bn_mont_mul_cond_copy
++	MOVQ	          DX, (tptr) 
++  POPQ            BP
++  RET
++
++// ###############################################################################################
++// # cvt_16x64_to_20x52(_a52, _b52, _m52 *big.Word, a0, a1, b0, b1, m0, m1 []big.Word)
++// #
++// # convert six big numbers a0, a1, .., m1 from 1024-bit radix 2^64 (16x64) to radix 2^52 (20x52)
++// # each big number input a0, a1, ... contains one radix 2^64 big number ([16]big.Word)
++// # each big number output contains two concatenated raidix 2^52 outputs, i.e.,
++// # _a52 = { a0_52, a1_52 }, _b52 = { b0_52, b1_52 }, and _m52 = { m0_52, m1_52 }
++// #
++// ###############################################################################################
++#undef t0
++#undef t1
++#undef t2
++#undef t3
++#undef t4
++#undef t5
++#define a52           DI
++#define a0            SI
++#define b52           DX
++#define b0            CX
++#define m52           R8
++#define m0            R9
++#define k             R10
++#define a1            R11
++#define b1            R12
++#define m1            R13
++#define shuffle0      Z0
++#define shuffle1      Z1
++#define shuffle2      Z2
++#define mask8         Z3
++#define mask4         Y4
++#define t0            Z5
++#define t1            Z6
++#define t2            Z7
++#define t3            Z8
++#define t4            Z9
++#define t5            Z10
++#define out0          Z11
++#define out1          Z12
++#define out2          Y13
++#define out2z         Z13
++
++#define convertRadix( x0, x8, dst, offset ) \
++  VMOVDQU64       radix52Cvt1<>(SB), shuffle1     /* load x6..x12 mask for VPERMI2B   */ \
++  VPERMB          x0, shuffle0, out0              /* convert x0..x5                   */ \ 
++  VPSRAQ          $4, out0, K1, out0              /* discard overlapping odd nibbles  */ \
++  VPANDQ          mask8, out0, out0               /* keep low 8x52                    */ \
++  VPERMI2B        (1*64)(x8), x0, K2, shuffle1    /* convert x6..x12                  */ \
++  VPSRAQ          $4, shuffle1, K1, shuffle1      /* discard overlapping odd nibbles  */ \
++  VMOVDQU64       out0, (0*64+offset)(dst)        /* write radix 2^52 x 20            */ \
++  VPANDQ          mask8, shuffle1, out1           /* keep low 8x52                    */ \
++  VPERMB          (1*64)(x8), shuffle2, out2z     /* convert x13..x15                 */ \
++  VPSRAQ          $4, out2, K1, out2              /* discard overlapping odd nibbles  */ \
++  VMOVDQU64       out1, (1*64+offset)(dst)                                               \ 
++  VPANDQ          mask4, out2, out2               /* keep low 4x52                    */ \
++  VMOVDQU32       out2, (2*64+offset)(dst) 
++
++TEXT ·cvt_16x64_to_20x52(SB),0,$0-168
++  MOVQ		        _a52+0(FP), a52                   
++  MOVQ			      _b52+8(FP), b52                  
++  MOVQ			      _m52+16(FP), m52                
++  MOVQ		        a0_base+24(FP), a0                    
++  MOVQ			      a1_base+48(FP), a1                    
++  MOVQ			      b0_base+72(FP), b0 
++  MOVQ		        b1_base+96(FP), b1                    
++  MOVQ			      m0_base+120(FP), m0                    
++  MOVQ			      m1_base+144(FP), m1 
++  MOVQ            $0xaa, k
++  KMOVD           k, K1                         // shift mask for discarding odd nibbles
++  XORQ            k, k 
++  NOTQ            k 
++  KMOVQ           k, K2                         // 0xfff...f write mask for VPERMI2B, i.e., all bytes enabled
++
++  // load a64, b64, m64
++  VMOVDQU64       (0*64)(a0), t0
++  VMOVDQU64       (0*64)(a1), t1
++  VMOVDQU64       (0*64)(b0), t2
++  VMOVDQU64       (0*64)(b1), t3
++  VMOVDQU64       (0*64)(m0), t4
++  VMOVDQU64       (0*64)(m1), t5
++
++  // init byte shuffles and 52-bit mask
++  VMOVDQU64       radix52Cvt0<>(SB), shuffle0
++  VMOVDQU64       radix52Cvt2<>(SB), shuffle2
++  VMOVDQU64       mask52x8<>(SB), mask8
++  VMOVDQU32       mask36<>(SB), mask4
++
++  // convert
++  convertRadix    ( t0, a0, a52, 0 )
++  convertRadix    ( t1, a1, a52, 160 )
++  convertRadix    ( t2, b0, b52, 0 )
++  convertRadix    ( t3, b1, b52, 160 )
++  convertRadix    ( t4, m0, m52, 0 )
++  convertRadix    ( t5, m1, m52, 160 )
++  RET
++
++// ###############################################################################################
++// # cvt_20x52_norm_to_16x64( x_64 []big.Word, y_52 *big.Word )
++// #
++// # convert BN of 1024-bits normalized radix 2^52 (20x52) to radix 2^64 (16x64)
++// # i.e., the high-order 12 bits on each 64-bit word are zero
++// #
++// ###############################################################################################
++#undef  t0
++#undef  t1
++#undef  t2
++#undef  t3
++#undef  t4
++#undef  t5
++#define src   SI
++#define dst   DI
++#define t0    R10
++#define t1    R11
++#define t2    R12
++#define t3    R14
++#define t4    R9
++#define t5    R13
++
++#define convert_to_16x64( i, x, acc, prev, right, left, offset )  \
++  MOVQ                ((i+1)*8)(src), x                           \ 
++  MOVQ                x, prev                                     \
++  SHRQ                $right, acc                                 \
++  SHLQ                $left, x                                    \
++  ADDQ                x, acc                                      \
++  MOVQ                acc, ((i-offset)*8)(dst)
++
++TEXT ·cvt_20x52_norm_to_16x64(SB),0,$0-32
++  MOVQ		            x64_base+0(FP), dst
++  MOVQ			          _x52+24(FP), src
++
++  // x0..3 
++  MOVQ                (0*8)(src), t0
++  convert_to_16x64    ( 0, t1, t0, t2, 0, 52, 0 )         // x0
++  convert_to_16x64    ( 1, t1, t2, t0, 12, 40, 0 )        // x1                     
++  convert_to_16x64    ( 2, t1, t0, t2, 24, 28, 0 )        // x2
++  convert_to_16x64    ( 3, t1, t2, t0, 36, 16, 0 )        // x3
++
++  // x4..7
++  MOVQ                (5*8)(src), t1                      // y5
++  MOVQ                t1, t4                              // y5 copy
++  SHLQ                $4, t1                              // y5 << 52
++  SHRQ                $48, t0                             // y4 >> 48
++  ADDQ                t0, t1        
++  MOVQ                (6*8)(src), t5                      // y6
++  MOVQ                t5, t3                              // copy y6
++  SHLQ                $56, t5                             // y6 << 56
++  ADDQ                t5, t1          
++  MOVQ                t1, (4*8)(dst)                      // x4 = y4>>48 + y5<<52 + y6<<56
++  MOVQ                (7*8)(src), t1                      // y7
++  MOVQ                t1, t2                              // y7 copy
++  SHRQ                $60, t4                             // y5 >> 60
++  SHRQ                $8, t3                              // y6 >> 8
++  ADDQ                t3, t4             
++  SHLQ                $44, t1                             // y7 << 44
++  ADDQ                t1, t4     
++  MOVQ                t4, (5*8)(dst)                      // x5 = y5>>60 + y6>>8 + y7<<44
++  convert_to_16x64    ( 7, t1, t2, t3, 20, 32, 1 )        // x6
++  convert_to_16x64    ( 8, t1, t3, t2, 32, 20, 1 )        // x7
++
++  // x8
++  MOVQ                (10*8)(src), t1                     // y10
++  MOVQ                t1, t5                              // y10 copy
++  MOVQ                (11*8)(src), t3                     // y11
++  MOVQ                t3, t0                              // y11 copy
++  SHRQ                $44, t2                             // y9 >> 44
++  SHLQ                $8, t1                              // y10 << 8
++  ADDQ                t1, t2
++  SHLQ                $60, t3                             // y11 << 60
++  ADDQ                t3, t2             
++  MOVQ                t2, (8*8)(dst)                      // x8 = y9>>44 + y10<<8 + y11<<60
++
++  // x9..12
++  MOVQ                (12*8)(src), t1                     // y12
++  MOVQ                t1, t2                              // y12 copy
++  SHRQ                $56, t5                             // y10 >> 56
++  SHRQ                $4, t0                              // y11 >> 4
++  ADDQ                t0, t5
++  SHLQ                $48, t1                             // y12 << 48
++  ADDQ                t1, t5             
++  MOVQ                t5, (9*8)(dst)                      // x9 = y10>>56 + y11>>4 + y12<<48
++  convert_to_16x64    ( 12, t1, t2, t0, 16, 36, 2 )       // x10
++  convert_to_16x64    ( 13, t1, t0, t2, 28, 24, 2 )       // x11
++  convert_to_16x64    ( 14, t1, t2, t0, 40, 12, 2 )       // x12
++
++  // x13..15
++  MOVQ                (16*8)(src), t1                     // y16
++  MOVQ                (17*8)(src), t2                     // y17
++  MOVQ                t2, t3                              // copy y17
++  SHRQ                $52, t0                             // y15 >> 52
++  ADDQ                t0, t1
++  SHLQ                $52, t2                             // y17 << 52
++  ADDQ                t2, t1
++  MOVQ                t1, (13*8)(dst)                     // x13 = y15>>52 + y16 + y17<<52
++  convert_to_16x64    ( 17, t1, t3, t2, 12, 40, 3 )       // x14
++  convert_to_16x64    ( 18, t1, t2, t3, 24, 28, 3 )       // x15
++  RET
++
++// 2^64 --> 2^52 radix conversion permutations
++// select low-order 52 bits in each bignum word
++DATA radix52Cvt0<>+0x00(SB)/8, $0x0006050403020100  
++DATA radix52Cvt0<>+0x08(SB)/8, $0x000c0b0a09080706  
++DATA radix52Cvt0<>+0x10(SB)/8, $0x00131211100f0e0d  
++DATA radix52Cvt0<>+0x18(SB)/8, $0x0019181716151413  
++DATA radix52Cvt0<>+0x20(SB)/8, $0x00201f1e1d1c1b1a  
++DATA radix52Cvt0<>+0x28(SB)/8, $0x0026252423222120  
++DATA radix52Cvt0<>+0x30(SB)/8, $0x002d2c2b2a292827  
++DATA radix52Cvt0<>+0x38(SB)/8, $0x00333231302f2e2d  
++GLOBL radix52Cvt0<>(SB), (NOPTR+RODATA), $64
++
++DATA radix52Cvt1<>+0x00(SB)/8, $0x003a393837363534  
++DATA radix52Cvt1<>+0x08(SB)/8, $0x00403f3e3d3c3b3a  
++DATA radix52Cvt1<>+0x10(SB)/8, $0x0047464544434241  
++DATA radix52Cvt1<>+0x18(SB)/8, $0x004d4c4b4a494847  
++DATA radix52Cvt1<>+0x20(SB)/8, $0x0054535251504f4e  
++DATA radix52Cvt1<>+0x28(SB)/8, $0x005a595857565554  
++DATA radix52Cvt1<>+0x30(SB)/8, $0x0061605f5e5d5c5b  
++DATA radix52Cvt1<>+0x38(SB)/8, $0x0067666564636261  
++GLOBL radix52Cvt1<>(SB), (NOPTR+RODATA), $64
++
++DATA radix52Cvt2<>+0x00(SB)/8, $0x002e2d2c2b2a2928  
++DATA radix52Cvt2<>+0x08(SB)/8, $0x0034333231302f2e  
++DATA radix52Cvt2<>+0x10(SB)/8, $0x003b3a3938373635  
++DATA radix52Cvt2<>+0x18(SB)/8, $0x0000003f3e3d3c3b  
++GLOBL radix52Cvt2<>(SB), (NOPTR+RODATA), $32
++
++DATA mask36<>+0x00(SB)/8, $0x000fffffffffffff  
++DATA mask36<>+0x08(SB)/8, $0x000fffffffffffff  
++DATA mask36<>+0x10(SB)/8, $0x000fffffffffffff  
++DATA mask36<>+0x18(SB)/8, $0x0000000fffffffff  
++GLOBL mask36<>(SB), (NOPTR+RODATA), $32
++
++DATA zeros<>+0x00(SB)/8, $0x0
++DATA zeros<>+0x08(SB)/8, $0x0
++DATA zeros<>+0x10(SB)/8, $0x0
++DATA zeros<>+0x18(SB)/8, $0x0
++GLOBL zeros<>(SB), (NOPTR+RODATA), $32
++
++DATA ones<>+0x00(SB)/8, $0x1
++DATA ones<>+0x08(SB)/8, $0x1
++DATA ones<>+0x10(SB)/8, $0x1
++DATA ones<>+0x18(SB)/8, $0x1
++GLOBL ones<>(SB), (NOPTR+RODATA), $32
++
++// 52-bit mask on ymm   
++DATA mask52x4<>+0x00(SB)/8, $0x000fffffffffffff
++DATA mask52x4<>+0x08(SB)/8, $0x000fffffffffffff
++DATA mask52x4<>+0x10(SB)/8, $0x000fffffffffffff
++DATA mask52x4<>+0x18(SB)/8, $0x000fffffffffffff
++GLOBL mask52x4<>(SB), (NOPTR+RODATA), $32
++
++// 52-bit mask on zmm 
++DATA mask52x8<>+0x00(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x08(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x10(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x18(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x20(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x28(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x30(SB)/8, $0x000fffffffffffff
++DATA mask52x8<>+0x38(SB)/8, $0x000fffffffffffff
++GLOBL mask52x8<>(SB), (NOPTR+RODATA), $64
+diff --git a/src/internal/cpu/cpu.go b/src/internal/cpu/cpu.go
+index 1352810f42..c082dd55d4 100644
+--- a/src/internal/cpu/cpu.go
++++ b/src/internal/cpu/cpu.go
+@@ -32,6 +32,7 @@ var X86 struct {
+ 	HasBMI1      bool
+ 	HasBMI2      bool
+ 	HasERMS      bool
++	HasIFMA      bool
+ 	HasFMA       bool
+ 	HasOSXSAVE   bool
+ 	HasPCLMULQDQ bool
+diff --git a/src/internal/cpu/cpu_x86.go b/src/internal/cpu/cpu_x86.go
+index 96b8ef92b5..e2e343174c 100644
+--- a/src/internal/cpu/cpu_x86.go
++++ b/src/internal/cpu/cpu_x86.go
+@@ -39,6 +39,7 @@ const (
+ 	cpuid_BMI2 = 1 << 8
+ 	cpuid_ERMS = 1 << 9
+ 	cpuid_ADX  = 1 << 19
++	cpuid_IFMA = 1 << 21
+ 	cpuid_SHA  = 1 << 29
+ 
+ 	// edx bits for CPUID 0x80000001
+@@ -128,6 +129,7 @@ func doinit() {
+ 	X86.HasERMS = isSet(ebx7, cpuid_ERMS)
+ 	X86.HasADX = isSet(ebx7, cpuid_ADX)
+ 	X86.HasSHA = isSet(ebx7, cpuid_SHA)
++	X86.HasIFMA = isSet(ebx7, cpuid_IFMA)
+ 
+ 	var maxExtendedInformation uint32
+ 	maxExtendedInformation, _, _, _ = cpuid(0x80000000, 0)
+-- 
+2.34.1
+
