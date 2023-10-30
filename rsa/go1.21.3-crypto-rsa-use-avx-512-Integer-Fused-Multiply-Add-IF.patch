@@ -1,4 +1,4 @@
-From a99fa6a1a91ad8c2a04f7b4b1ca920ffad2e95d2 Mon Sep 17 00:00:00 2001
+From 7e5da99d985db1cd98b16e1f1aba0dd66fcc6713 Mon Sep 17 00:00:00 2001
 From: ted <ted.painter@intel.com>
 Date: Tue, 4 Apr 2023 00:03:46 -0400
 Subject: [PATCH] crypto/rsa: use avx-512 Integer Fused Multiply Add (IFMA)
@@ -29,7 +29,7 @@ Change-Id: I995db9c5ec560990726a8ed8108080ef7a62a00a
  create mode 100644 src/crypto/rsa/rsa_ifma.s
 
 diff --git a/src/crypto/rsa/pkcs1v15.go b/src/crypto/rsa/pkcs1v15.go
-index 55fea1ab93..298e30b5c6 100644
+index 2705036fdd..fca0f4867d 100644
 --- a/src/crypto/rsa/pkcs1v15.go
 +++ b/src/crypto/rsa/pkcs1v15.go
 @@ -10,7 +10,9 @@ import (

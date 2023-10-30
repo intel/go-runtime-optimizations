@@ -1,4 +1,4 @@
-From 8ed8265d9765e9e5032de7be4ca60aa604f92192 Mon Sep 17 00:00:00 2001
+From c5242bd8589ce6a344f86c3a2b3694b6c34da9d3 Mon Sep 17 00:00:00 2001
 From: ted <ted.painter@intel.com>
 Date: Wed, 14 Jul 2021 14:03:01 -0400
 Subject: [PATCH] crypto/aes: Implement new and improved AES-GCM ciphers
@@ -19,18 +19,18 @@ Addresses #42726
 
 Change-Id: I4b25082f54cff3cb4a6c922728fb9514651bba81
 ---
- src/crypto/aes/aes_gcm.go    |  425 ++++-
+ src/crypto/aes/aes_gcm.go    |  427 ++++-
  src/crypto/aes/aes_test.go   |    2 +-
  src/crypto/aes/cipher.go     |    3 +-
  src/crypto/aes/cipher_asm.go |    2 +-
  src/crypto/aes/gcmv_amd64.h  |  105 ++
  src/crypto/aes/gcmv_amd64.s  | 3141 ++++++++++++++++++++++++++++++++++
- 6 files changed, 3657 insertions(+), 21 deletions(-)
+ 6 files changed, 3658 insertions(+), 22 deletions(-)
  create mode 100644 src/crypto/aes/gcmv_amd64.h
  create mode 100644 src/crypto/aes/gcmv_amd64.s
 
 diff --git a/src/crypto/aes/aes_gcm.go b/src/crypto/aes/aes_gcm.go
-index f77d27969a..020d86f838 100644
+index 036705feca..737f407d22 100644
 --- a/src/crypto/aes/aes_gcm.go
 +++ b/src/crypto/aes/aes_gcm.go
 @@ -11,9 +11,20 @@ import (
@@ -343,7 +343,7 @@ index f77d27969a..020d86f838 100644
 +var supportsAVX512VAES = cpu.X86.HasAVX512 && cpu.X86.HasAVX512VAES && cpu.X86.HasAVX512VPCLMULQDQ
 +
  // NewGCM returns the AES cipher wrapped in Galois Counter Mode. This is only
- // called by crypto/cipher.NewGCM via the gcmAble interface.
+ // called by [crypto/cipher.NewGCM] via the gcmAble interface.
  func (c *aesCipherGCM) NewGCM(nonceSize, tagSize int) (cipher.AEAD, error) {
 -	g := &gcmAsm{ks: c.enc, nonceSize: nonceSize, tagSize: tagSize}
 -	gcmAesInit(&g.productTable, g.ks)
@@ -383,10 +383,11 @@ index f77d27969a..020d86f838 100644
  	return g.tagSize
  }
  
-@@ -86,6 +363,77 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
+@@ -86,7 +363,78 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
  	return
  }
  
+-// Seal encrypts and authenticates plaintext. See the [cipher.AEAD] interface for
 +// Seal encrypts and authenticates plaintext. See the cipher.AEAD interface for details.
 +func (g *gcmAsmVaes) Seal(dst, nonce, plaintext, data []byte) []byte {
 +	if len(nonce) != g.nonceSize {
@@ -458,9 +459,10 @@ index f77d27969a..020d86f838 100644
 +	return g.tagSize
 +}
 +
- // Seal encrypts and authenticates plaintext. See the cipher.AEAD interface for
++// Seal encrypts and authenticates plaintext. See the cipher.AEAD interface for
  // details.
  func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
+ 	if len(nonce) != g.nonceSize {
 @@ -184,3 +532,44 @@ func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
  
  	return ret, nil
@@ -520,7 +522,7 @@ index 1e8bac4bb5..6d37856632 100644
  	for i := 0; i < b.N; i++ {
  		expandKey(tt.key, c.enc, c.dec)
 diff --git a/src/crypto/aes/cipher.go b/src/crypto/aes/cipher.go
-index 183c1697c8..0f1a87d9da 100644
+index a9e6208696..a14205d592 100644
 --- a/src/crypto/aes/cipher.go
 +++ b/src/crypto/aes/cipher.go
 @@ -18,6 +18,7 @@ const BlockSize = 16

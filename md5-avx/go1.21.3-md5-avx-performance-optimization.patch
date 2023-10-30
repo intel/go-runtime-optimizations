@@ -1,5 +1,5 @@
-From 2e6913a73f22f34770daf76d0953eecb84f69044 Mon Sep 17 00:00:00 2001
-From: Priya Vaidya <priya.n.vaidya@intel.com>
+From 61104040c35d1a8abec93617eaa937c6c6e5e5b1 Mon Sep 17 00:00:00 2001
+From: parkerha1 <priya.n.vaidya@intel.com>
 Date: Mon, 5 Dec 2022 18:18:59 +0000
 Subject: [PATCH] md5: performance optimization
 
@@ -8,11 +8,11 @@ uses vpternlod instruction
 
 Change-Id: I4725edaa9b300c8b02480348ec1009043db14d61
 ---
- src/crypto/md5/md5block_amd64.go |   9 +
- src/crypto/md5/md5block_amd64.s  | 278 ++++++++++++++++++++++++++++++-
+ src/crypto/md5/md5block_amd64.go |   9 ++
+ src/crypto/md5/md5block_amd64.s  | 259 ++++++++++++++++++++++++++++++-
  src/internal/cpu/cpu.go          |  43 ++---
  src/internal/cpu/cpu_x86.go      |  33 +++-
- 4 files changed, 329 insertions(+), 34 deletions(-)
+ 4 files changed, 317 insertions(+), 27 deletions(-)
  create mode 100644 src/crypto/md5/md5block_amd64.go
 
 diff --git a/src/crypto/md5/md5block_amd64.go b/src/crypto/md5/md5block_amd64.go
@@ -31,7 +31,7 @@ index 0000000000..819787a3d9
 +
 +var useAVX512 = cpu.X86.HasAVX512F && cpu.X86.HasAVX512VL
 diff --git a/src/crypto/md5/md5block_amd64.s b/src/crypto/md5/md5block_amd64.s
-index 7c7d92d7e8..d473c3107b 100644
+index 75c8074b37..b48e45d056 100644
 --- a/src/crypto/md5/md5block_amd64.s
 +++ b/src/crypto/md5/md5block_amd64.s
 @@ -14,6 +14,9 @@
@@ -44,61 +44,16 @@ index 7c7d92d7e8..d473c3107b 100644
  	MOVQ	dig+0(FP),	BP
  	MOVQ	p+8(FP),	SI
  	MOVQ	p_len+16(FP), DX
-@@ -40,10 +43,11 @@ loop:
- 
- #define ROUND1(a, b, c, d, index, const, shift) \
- 	XORL	c, R9; \
--	LEAL	const(a)(R8*1), a; \
-+        ADDL $const, a; \
- 	ANDL	b, R9; \
-+        ADDL  R8, a; \
- 	XORL d, R9; \
--	MOVL (index*4)(SI), R8; \
-+        MOVL (index*4)(SI), R8; \
- 	ADDL R9, a; \
- 	ROLL $shift, a; \
- 	MOVL c, R9; \
-@@ -72,13 +76,15 @@ loop:
- 
- #define ROUND2(a, b, c, d, index, const, shift) \
- 	NOTL	R9; \
--	LEAL	const(a)(R8*1),a; \
-+	ADDL $const, a; \
-+        ANDL    c,   R9; \
-+        ADDL    R8, a; \
-+        MOVL    d,   R10; \
-+        ADDL    R9,  a ; \
+@@ -78,7 +81,7 @@ loop:
+ 	ADDL	$const,	a; \
+ 	ADDL	R8,	a; \
  	ANDL	b,		R10; \
 -	ANDL	c,		R9; \
-+        ADDL    R10, a; \
++    ADDL    R10, a; \
  	MOVL	(index*4)(SI),R8; \
--	ORL	R9,		R10; \
- 	MOVL	c,		R9; \
--	ADDL	R10,		a; \
- 	MOVL	c,		R10; \
- 	ROLL	$shift,	a; \
- 	ADDL	b,		a
-@@ -104,7 +110,8 @@ loop:
- 	MOVL	CX,		R9
- 
- #define ROUND3(a, b, c, d, index, const, shift) \
--	LEAL	const(a)(R8*1),a; \
-+	ADDL	$const,a; \
-+        ADDL    R8, a; \
- 	MOVL	(index*4)(SI),R8; \
- 	XORL	d,		R9; \
- 	XORL	b,		R9; \
-@@ -135,7 +142,8 @@ loop:
- 	XORL	DX,		R9
- 
- #define ROUND4(a, b, c, d, index, const, shift) \
--	LEAL	const(a)(R8*1),a; \
-+        ADDL    $const, a; \
-+        ADDL    R8, a; \
- 	ORL	b,		R9; \
- 	XORL	c,		R9; \
- 	ADDL	R9,		a; \
-@@ -177,3 +185,257 @@ end:
+ 	ADDL	R9,	a; \
+ 	ADDL	R10,	a; \
+@@ -193,3 +196,257 @@ end:
  	MOVL	CX,		(2*4)(BP)
  	MOVL	DX,		(3*4)(BP)
  	RET

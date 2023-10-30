@@ -10,12 +10,11 @@ The instructions below assume that the user has a local copy of the Go runtime. 
 
 ```bash
     git clone https://github.com/go-runtime-optimizations.git
-    cp go-runtime-optimizations/md5-avx/go121-md5-performance-optimization.patch <your-GOROOT-directory>
+    cp go-runtime-optimizations/md5-avx/go1.21.3-md5-avx-performance-optimization.patch <your-GOROOT-directory>
     cd <your-GOROOT-directory>
-    git git apply --whitespace=fix go121-md5-performance-optimization.patch
+    git apply --whitespace=fix go1.21.3-md5-avx-performance-optimization.patch
 ```
-*NB: The patches will be updated with each release of the runtime, and a prefix will be attached to the name of the patch to reflect the Go release version it was built against. The current patch
-    contains the prefix "go121" since it was built against Go 1.21. Make sure you choose the patch that matches or closely matches your Go runtime version.*
+*NB: The patches will be updated with each release of the runtime, and a prefix will be attached to the name of the patch to reflect the Go release version it was built against. The current patch contains the prefix "go1.21.3" since it was built against Go 1.21.3. Make sure you choose the patch that matches or closely matches your Go runtime version.*
 
 ### Test
 These instructions are to be executed after you build the patched runtime and properly set your environment variables to use it.
